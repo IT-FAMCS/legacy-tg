@@ -1,0 +1,23 @@
+services:
+  bot:
+    image: ghcr.io/it-famcs/legacy-tg:latest
+    build: .
+    container_name: legacy-tg
+    env_file:
+      - .env
+    environment:
+      PORT: "8080"
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
