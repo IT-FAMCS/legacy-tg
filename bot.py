@@ -5,7 +5,7 @@ import logging
 import os
 import re
 import signal
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import URLError
 from urllib.parse import urlsplit
@@ -16,7 +16,7 @@ LOG = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class Settings:
-    token: str
+    token: str = field(repr=False)
     webapp_url: str
     name: str = "Наследие ФПМИ"
     port: int = 8080
@@ -69,10 +69,12 @@ def configure_bot(settings):
 
 
 class HealthHandler(BaseHTTPRequestHandler):
+    readiness = staticmethod(lambda: True)
     def do_GET(self):
-        healthy = self.path == "/healthz"
+        found = self.path == "/healthz"
+        healthy = found and self.readiness()
         body = b'{"status":"ok"}' if healthy else b'{"error":"not found"}'
-        self.send_response(200 if healthy else 404)
+        self.send_response(200 if healthy else 503 if found else 404)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -87,6 +89,15 @@ def main():
     try:
         settings = Settings.from_env(os.environ)
         configure_bot(settings)
+        from clients import BackendClient, TelegramClient
+        from store import Store
+        from runtime import Runtime
+        backend = BackendClient(os.getenv('BACKEND_URL', settings.webapp_url), os.getenv('TELEGRAM_SERVICE_KEY', ''))
+        store = Store(os.getenv('BOT_DB_PATH', '/data/bot.sqlite3'))
+        runtime = Runtime(backend, TelegramClient(settings.token), store, settings.webapp_url,
+                          int(os.getenv('NOTIFICATION_POLL_SECONDS', '10')))
+        runtime.start()
+        HealthHandler.readiness = staticmethod(runtime.ready)
     except (ValueError, RuntimeError) as error:
         LOG.error("%s", error)
         return 1
@@ -96,9 +107,12 @@ def main():
 
     signal.signal(signal.SIGTERM, terminate)
     signal.signal(signal.SIGINT, terminate)
-    LOG.info("Telegram menu configured; starting health server")
-    with ThreadingHTTPServer(("0.0.0.0", settings.port), HealthHandler) as server:
-        server.serve_forever()
+    LOG.info("Telegram chat runtime started; no credentials are logged")
+    try:
+        with ThreadingHTTPServer(("0.0.0.0", settings.port), HealthHandler) as server:
+            server.serve_forever()
+    finally:
+        runtime.stop()
     return 0
 
 
