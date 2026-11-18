@@ -3,6 +3,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from clients import ApiError
 from zones_chat import ZonesMixin
+from task_form import TaskFormMixin
 
 PAGE=5
 
@@ -31,7 +32,7 @@ def date_label(value):
     except ValueError:return str(value)
 
 
-class Chat(ZonesMixin):
+class Chat(TaskFormMixin,ZonesMixin):
     def __init__(self,backend,store,webapp_url):
         self.backend,self.store,self.webapp_url=backend,store,webapp_url.rstrip('/')
         self.me=None
@@ -44,14 +45,14 @@ class Chat(ZonesMixin):
 
     def button(self,text,kind,**values):
         style='primary'
-        if kind in {'complete','take','save_draft','zone_save','zone_save_helpers'}:
+        if kind in {'complete','take','save_draft','zone_save','zone_save_helpers','task_save'}:
             style='success'
         elif kind in {'delete','delete_confirm','unlink','zone_delete','zone_delete_confirm','zone_clear','zone_clear_confirm'}:
             style='danger'
         elif kind=='notifications':
             style='success' if values['enabled'] else 'danger'
         return {'text':clip(text,55),'style':style,
-                'callback_data':self.store.callback(self.tid,self.generation,{'kind':kind,**values})}
+                'callback_data':self.store.callback(self.tid,self.generation,{'kind':kind,'menu':True,**values})}
 
     def reply(self,text,rows=None,task_ids=()):
         if self.notice:
@@ -59,10 +60,12 @@ class Chat(ZonesMixin):
             self.notice=''
         payload={'chat_id':self.tid,'text':text,'link_preview_options':{'is_disabled':True}}
         if rows:payload['reply_markup']={'inline_keyboard':rows}
+        if self.new_menu:payload['_new_menu']=self.menu_session
+        elif self.menu_message_id:payload['_menu_message_id']=self.menu_message_id
         self.store.enqueue('menu',payload,self.tid,self.generation or None,task_ids)
 
     def main_menu(self,text='Наследие · выберите раздел'):
-        self.reply(text,[[self.button('Мои таски','tasks')],[self.button('Оборудка','equipment')],[self.button('Мероприятия · зоны','zone_events')],
+        self.reply(text,[[self.button('Таски','tasks')],[self.button('Оборудка','equipment')],[self.button('Мероприятия · зоны','zone_events')],
                          [{'text':'Открыть Наследие','style':'primary','url':self.webapp_url}],
                          [self.button('Привязка аккаунта','link')]])
 
@@ -82,9 +85,12 @@ class Chat(ZonesMixin):
             tid=sender.get('id')
             if type(tid) is not int or tid<=0 or chat.get('type')!='private' or chat.get('id')!=tid or sender.get('is_bot'):
                 self.store.finish(update_id);return
-            self.tid=tid;self.me=None;self.notice='';self.request_id=f'update:{update_id}'
+            self.tid=tid;self.me=None;self.notice='';self.new_menu=False;self.menu_message_id=None;self.request_id=f'update:{update_id}'
             text=message.get('text') or ''
             command=text.split(maxsplit=1)[0].split('@')[0] if text else ''
+            self.menu_session=f'update:{update_id}'
+            section_commands={'/start','/help','/tasks','/equipment','/zones','/link','/unlink','/cancel'}
+            self.new_menu=command in section_commands
             try:
                 if command=='/start' and len(text.split(maxsplit=1))==2 and text.split(maxsplit=1)[1].startswith('link_'):
                     if message.get('forward_origin') or message.get('forward_from'):
@@ -101,6 +107,12 @@ class Chat(ZonesMixin):
                 if callback:
                     token=callback.get('data','')
                     entry=self.store.action(token,tid,self.generation)
+                    source_id=callback.get('message',{}).get('message_id')
+                    self.new_menu=bool(entry and entry['data'].get('new_menu')) or (
+                        type(source_id) is int and source_id != self.store.menu_message(tid)
+                        and not (entry and entry['data'].get('menu')))
+                    if not self.new_menu and type(source_id) is int:self.menu_message_id=source_id
+                    if self.new_menu:self.store.set_state(tid,self.generation,None)
                     if not entry:self.main_menu('Кнопка устарела. Выберите раздел.')
                     elif entry['done']:self.main_menu('Это действие уже выполнено. Выберите раздел.')
                     else:
@@ -108,14 +120,14 @@ class Chat(ZonesMixin):
                         self.action(entry['data'],token)
                 elif command=='/cancel':
                     self.store.set_state(tid,self.generation,None);self.main_menu('Изменения отменены.')
-                elif command in {'/start','/help','/tasks','/equipment','/zones','/link','/unlink'}:
+                elif command in section_commands:
                     self.store.set_state(tid,self.generation,None)
                     if command=='/tasks':self.tasks()
                     elif command=='/equipment':self.equipment()
                     elif command=='/zones':self.events()
                     elif command=='/link':self.reply(f"Аккаунт привязан: {self.me['name']}. Отключить: /unlink.",[[{'text':'Профиль','style':'primary','url':self.webapp_url+'/account'}]])
                     elif command=='/unlink':self.reply('Отключить Telegram от аккаунта Наследия?',[[self.button('Отключить','unlink')],[self.button('Отмена','menu')]])
-                    else:self.main_menu('Наследие · таски и оборудка в чате.\n/tasks — свои таски\n/equipment — оборудка\n/zones — зоны мероприятий\n/cancel — отменить ввод\n/unlink — отключить аккаунт')
+                    else:self.main_menu('Наследие · таски и оборудка в чате.\n/tasks — список тасок\n/equipment — оборудка\n/zones — зоны мероприятий\n/cancel — отменить ввод\n/unlink — отключить аккаунт')
                 else:self.text(text)
             except ApiError as error:
                 self.reply(str(error),[[self.button('Главное меню','menu')]])
@@ -126,24 +138,26 @@ class Chat(ZonesMixin):
         scope=f'/{task_id}' if task_id is not None else ''
         return f'bot/tasks{scope}/preferences/notifications'
 
-    def notification_button(self,task_id=None,page=0,completed=False):
+    def notification_button(self,task_id=None,page=0,completed=False,all_tasks=False):
         enabled=self.api('GET',self.preference_path(task_id))['enabled']
         action='Отключить' if enabled else 'Включить'
         scope='уведомления по таске' if task_id is not None else 'все уведомления о тасках'
-        return self.button(f'{action} {scope}','notifications',id=task_id,page=page,completed=completed,enabled=not enabled)
+        return self.button(f'{action} {scope}','notifications',id=task_id,page=page,completed=completed,all_tasks=all_tasks,enabled=not enabled)
 
-    def tasks(self,page=0,completed=False):
-        path='bot/tasks?include_created=true'
-        if completed:path+='&include_completed=true'
+    def tasks(self,page=0,completed=False,all_tasks=False):
+        path='bot/tasks?scope=all' if all_tasks else 'bot/tasks?include_created=true'
+        if completed and not all_tasks:path+='&include_completed=true'
         tasks=[task for task in self.api('GET',path) if task['completed']==completed]
         page=max(0,min(page,max(0,(len(tasks)-1)//PAGE)))
         subset=tasks[page*PAGE:(page+1)*PAGE]
-        rows=[[self.button(task['title'],'task',id=task['id'])] for task in subset]
-        self.pagination(rows,page,len(tasks),'tasks',completed=completed)
-        rows.append([self.button('К действующим таскам' if completed else 'Выполненные таски','tasks',completed=not completed)])
-        rows.append([self.notification_button(page=page,completed=completed)])
+        rows=[[self.button(task['title'],'task',id=task['id'],all_tasks=all_tasks)] for task in subset]
+        self.pagination(rows,page,len(tasks),'tasks',completed=completed,all_tasks=all_tasks)
+        rows.append([self.button('К действующим таскам' if completed else 'Выполненные таски','tasks',completed=not completed,all_tasks=all_tasks)])
+        rows.append([self.button('Мои таски' if all_tasks else 'Все доступные таски','tasks',all_tasks=not all_tasks)])
+        rows.append([self.button('Создать таску','task_new',all_tasks=all_tasks)])
+        rows.append([self.notification_button(page=page,completed=completed,all_tasks=all_tasks)])
         rows.append([self.button('Главное меню','menu')])
-        label='Выполненные таски' if completed else 'Мои действующие таски'
+        label=('Все доступные таски' if all_tasks else 'Мои таски')+(' · выполненные' if completed else ' · в работе')
         text=f'{label} · {len(tasks)}'
         if tasks:text+='\nВыберите таску.'
         self.reply(text,rows,[task['id'] for task in subset])
@@ -154,23 +168,26 @@ class Chat(ZonesMixin):
         if (page+1)*per_page<total:navigation.append(self.button('Далее →',kind,page=page+1,**values))
         if navigation:rows.append(navigation)
 
-    def task(self,task_id,page=0):
+    def task(self,task_id,page=0,all_tasks=False):
         task=self.api('GET',f'bot/tasks/{task_id}')
         pieces=chunks(task.get('description') or 'Без описания',1400);page=max(0,min(page,len(pieces)-1))
         text=f"{clip(task['title'],500)}\nДедлайн: {task.get('deadline') or 'без срока'}\n"
         status='В архиве' if task.get('archived') else 'Выполнена' if task['completed'] else 'В работе'
         text+='Статус: '+status+'\n'
         text+='Создатель: '+clip(task.get('creator_name') or 'Не указан',200)+'\n'
+        text+='Ответственные: '+clip(', '.join(u['name'] for u in task.get('assignees',[])) or '—',300)+'\n'
         text+='Отделы: '+clip(', '.join(d['title'] for d in task.get('departments',[])) or '—',300)+'\n'
         text+='Мероприятие: '+clip((task.get('event') or {}).get('title','—'),200)+'\n\n'+pieces[page]
         rows=[]
+        if not task.get('archived'):
+            rows.append([self.button('Редактировать таску','task_edit',id=task_id,all_tasks=all_tasks)])
         if task['can_change_status'] and not task.get('archived'):
             label='Вернуть в работу' if task['completed'] else 'Выполнено'
-            rows.append([self.button(label,'complete',id=task_id,version=task['version'],completed=not task['completed'])])
-        if page>0:rows.append([self.button('← Описание','task',id=task_id,page=page-1)])
-        if page+1<len(pieces):rows.append([self.button('Описание далее →','task',id=task_id,page=page+1)])
-        rows.append([self.notification_button(task_id,page)])
-        rows.append([self.button('К моим таскам','tasks',completed=task['completed'])])
+            rows.append([self.button(label,'complete',id=task_id,version=task['version'],completed=not task['completed'],all_tasks=all_tasks)])
+        if page>0:rows.append([self.button('← Описание','task',id=task_id,page=page-1,all_tasks=all_tasks)])
+        if page+1<len(pieces):rows.append([self.button('Описание далее →','task',id=task_id,page=page+1,all_tasks=all_tasks)])
+        rows.append([self.notification_button(task_id,page,all_tasks=all_tasks)])
+        rows.append([self.button('К списку тасок' if all_tasks else 'К моим таскам','tasks',completed=task['completed'],all_tasks=all_tasks)])
         self.reply(text,rows,[task_id])
 
     def equipment(self,page=0,query=''):
@@ -210,7 +227,15 @@ class Chat(ZonesMixin):
         rows.append([self.button('К списку оборудки','equipment')]);self.reply(text if entries else 'История пуста.',rows)
 
     def state(self):return self.store.state(self.tid,self.generation)
-    def set_state(self,state):self.store.set_state(self.tid,self.generation,state)
+    def set_state(self,state):
+        if state is not None:
+            if self.new_menu:
+                state['_menu_session']=self.menu_session
+                state.pop('_menu_message_id',None)
+            elif self.menu_message_id:
+                state['_menu_message_id']=self.menu_message_id
+                state.pop('_menu_session',None)
+        self.store.set_state(self.tid,self.generation,state)
     def flow(self,action):
         state=self.state()
         if not state or state.get('flow')!=action.get('flow'):raise ApiError(409,'Ввод отменён или истёк. Начните действие заново.')
@@ -249,23 +274,23 @@ class Chat(ZonesMixin):
         self.reply('Выберите пользователя' if scope=='users' else 'Выберите место хранения',rows)
 
     def action(self,data,token):
-        if self.zone_action(data,token):return
+        if self.task_form_action(data,token) or self.zone_action(data,token):return
         kind=data['kind'];page=data.get('page',0);item_id=data.get('id')
         if kind=='menu':self.main_menu()
         elif kind=='link':self.reply('Управление привязкой: /link или /unlink.',[[{'text':'Профиль','style':'primary','url':self.webapp_url+'/account'}]])
-        elif kind=='tasks':self.tasks(page,data.get('completed',False))
-        elif kind=='task':self.task(item_id,page)
+        elif kind=='tasks':self.set_state(None);self.tasks(page,data.get('completed',False),data.get('all_tasks',False))
+        elif kind=='task':self.set_state(None);self.task(item_id,page,data.get('all_tasks',False))
         elif kind=='notifications':
             self.api('PUT',self.preference_path(item_id),{'enabled':data['enabled']})
             self.store.done(token)
-            if item_id is None:self.tasks(page,data.get('completed',False))
-            else:self.task(item_id,page)
+            if item_id is None:self.tasks(page,data.get('completed',False),data.get('all_tasks',False))
+            else:self.task(item_id,page,data.get('all_tasks',False))
         elif kind=='complete':
             completed=data.get('completed',True)
             self.api('PATCH',f'bot/tasks/{item_id}',{'version':data['version'],'completed':completed})
             self.store.done(token)
             self.notice='Таска выполнена.' if completed else 'Таска возвращена в работу.'
-            self.task(item_id)
+            self.task(item_id,all_tasks=data.get('all_tasks',False))
         elif kind=='equipment':self.equipment(page,data.get('query',''))
         elif kind=='item':self.item(item_id,page)
         elif kind=='history':self.history(item_id,page)
@@ -323,9 +348,15 @@ class Chat(ZonesMixin):
     def text(self,text):
         state=self.state()
         if not state:self.main_menu('Выберите действие кнопками или используйте /tasks и /equipment.');return
+        if state.get('_menu_message_id'):
+            self.menu_message_id=state['_menu_message_id']
+        elif state.get('_menu_session'):
+            self.new_menu=True
+            self.menu_session=state['_menu_session']
         text=text.strip()
         if not text:self.reply('Нужен текст. /cancel — отменить ввод.');return
         kind=state['kind']
+        if kind.startswith('task_'):self.task_form_text(state,text);return
         if kind.startswith('zone_'):self.zone_text(state,text);return
         if kind=='equipment_search':self.set_state(None);self.equipment(query=text[:200]);return
         self.options_manager()

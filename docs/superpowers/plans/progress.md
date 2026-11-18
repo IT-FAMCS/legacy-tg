@@ -11,3 +11,5 @@ Review: targeted final rereview reported no important remaining defects. Local N
 Integration: local commits only, no merge/push/deploy or real Telegram messages. Local web preview can use copied development DB with Telegram integration unconfigured; live bot needs configured BOT_TOKEN/service key/username plus persistent bot-data volume.
 
 Ruling: deleting an event after all zones were removed also removes its auxiliary board/history, preventing orphan constraints and reused-ID disclosure; regression observed RED then GREEN.
+
+2026-11-18: Task forms and separate menu messages verified in tg-bot worktree. /tasks includes own/all accessible tasks, create/edit fields and backend-controlled status. Section commands and notification entry points create new messages; navigation and form text retain the originating menu. Verification: bot 41 unit tests; 5 real-backend integrations against ../legacy-back; 11 backend Telegram permission tests. No real Telegram traffic or deployment. Current shared task API lives in legacy-back; tg-back worktree is older.

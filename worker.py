@@ -45,25 +45,27 @@ class DeliveryWorker:
             except TransportError:self.store.retry(row['id'],min(3600,5*2**min(row['attempts'],8)))
 
     def deliver_menu(self,row):
-        payload=row['payload']
+        payload=dict(row['payload'])
+        new_menu=payload.pop('_new_menu',False)
         chat_id=payload['chat_id']
-        message_id=self.store.menu_message(chat_id)
+        target_id=payload.pop('_menu_message_id',None)
+        message_id=self.store.menu_session(chat_id,new_menu) if new_menu else target_id or self.store.menu_message(chat_id)
         if message_id:
             try:
                 self.telegram.call('editMessageText',{**payload,'message_id':message_id})
             except TelegramError as error:
                 if error.reason=='unchanged':
-                    self.store.delivered(row['id'])
+                    self.store.menu_sent(row['id'],chat_id,message_id,new_menu)
                     return
                 if error.reason!='missing':
                     raise
             else:
-                self.store.delivered(row['id'])
+                self.store.menu_sent(row['id'],chat_id,message_id,new_menu)
                 return
         result=self.telegram.call('sendMessage',payload)
         if not isinstance(result,dict) or type(result.get('message_id')) is not int or result['message_id']<=0:
             raise TransportError('Telegram did not return a menu message ID')
-        self.store.menu_sent(row['id'],chat_id,result['message_id'])
+        self.store.menu_sent(row['id'],chat_id,result['message_id'],new_menu)
 
     def notifications(self):
         if not self.store.sending_allowed():return
@@ -78,10 +80,15 @@ class DeliveryWorker:
                     outcome='permanent'
                 else:
                     payload={'chat_id':row['chat_id'],'text':row['text'],'link_preview_options':{'is_disabled':True}}
+                    validation=self.backend.request('POST',f"service/notifications/{row['id']}/validate",
+                        {'lease_token':row['lease_token']})
+                    if not validation['valid']:
+                        self.backend.request('POST',f"service/notifications/{row['id']}/ack",
+                            {'lease_token':row['lease_token'],'outcome':'permanent'})
+                        continue
+                    payload['text']=validation['text']
                     if row['kind']!='removed':
-                        # Validate current assignment/access again immediately before the external send.
-                        self.backend.request('GET',f"bot/tasks/{row['task_id']}",tid=row['telegram_user_id'],generation=row['generation'])
-                        token=self.store.callback(row['telegram_user_id'],row['generation'],{'kind':'task','id':row['task_id']})
+                        token=self.store.callback(row['telegram_user_id'],row['generation'],{'kind':'task','id':row['task_id'],'new_menu':True},persistent=True)
                         payload['reply_markup']={'inline_keyboard':[[{'text':'Открыть таску','style':'primary','callback_data':token}]]}
                     self.telegram.call('sendMessage',payload)
             except ApiError as error:

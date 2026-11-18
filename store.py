@@ -19,13 +19,15 @@ class Store:
             CREATE TABLE IF NOT EXISTS callbacks(token TEXT PRIMARY KEY,tid INTEGER NOT NULL,generation TEXT NOT NULL,data TEXT NOT NULL,expires REAL NOT NULL,done INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS outgoing(id INTEGER PRIMARY KEY,method TEXT NOT NULL,payload TEXT NOT NULL,tid INTEGER,generation TEXT,task_ids TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,next_at REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS menus(chat_id INTEGER PRIMARY KEY,message_id INTEGER NOT NULL);
-            CREATE TRIGGER IF NOT EXISTS latest_menu AFTER INSERT ON outgoing WHEN NEW.method='menu'
+            CREATE TABLE IF NOT EXISTS menu_sessions(session TEXT PRIMARY KEY,message_id INTEGER NOT NULL);
+            DROP TRIGGER IF EXISTS latest_menu;
+            CREATE TRIGGER latest_menu AFTER INSERT ON outgoing WHEN NEW.method='menu'
             BEGIN
-                DELETE FROM outgoing WHERE method='menu' AND tid=NEW.tid AND id<NEW.id;
+                DELETE FROM outgoing WHERE method='menu' AND tid=NEW.tid AND id<NEW.id
+                    AND COALESCE(json_extract(payload,'$._new_menu'),'')=COALESCE(json_extract(NEW.payload,'$._new_menu'),'')
+                    AND COALESCE(json_extract(payload,'$._menu_message_id'),0)=COALESCE(json_extract(NEW.payload,'$._menu_message_id'),0);
             END;
             UPDATE outgoing SET method='menu' WHERE method='sendMessage' AND tid IS NOT NULL;
-            DELETE FROM outgoing WHERE method='menu' AND id NOT IN
-                (SELECT MAX(id) FROM outgoing WHERE method='menu' GROUP BY tid);
             ''')
 
     @contextmanager
@@ -71,7 +73,7 @@ class Store:
         offset=max(update_id+1,int(current['value']) if current else 0)
         db.execute("INSERT INTO runtime(key,value) VALUES('offset',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(offset),))
         db.execute('DELETE FROM processed WHERE id < ?',(offset-10000,))
-        db.execute('DELETE FROM callbacks WHERE expires<?',(time.time(),))
+        db.execute('DELETE FROM callbacks WHERE expires>0 AND expires<?',(time.time(),))
         db.execute('DELETE FROM drafts WHERE expires<?',(time.time(),))
 
     def finish(self,update_id):
@@ -101,15 +103,15 @@ class Store:
         else:self._write('INSERT INTO drafts VALUES(?,?,?,?) ON CONFLICT(tid) DO UPDATE SET generation=excluded.generation,data=excluded.data,expires=excluded.expires',
                         (tid,generation,json.dumps(data,ensure_ascii=False),time.time()+1800))
 
-    def callback(self,tid,generation,data):
+    def callback(self,tid,generation,data,*,persistent=False):
         token=secrets.token_urlsafe(12)
         self._write('INSERT INTO callbacks(token,tid,generation,data,expires) VALUES(?,?,?,?,?)',
-                    (token,tid,generation,json.dumps(data,ensure_ascii=False),time.time()+600))
+                    (token,tid,generation,json.dumps(data,ensure_ascii=False),0 if persistent else time.time()+600))
         return 'c:'+token
 
     def action(self,token,tid,generation):
         if not isinstance(token,str) or not token.startswith('c:'):return None
-        rows=self._read('SELECT * FROM callbacks WHERE token=? AND tid=? AND generation=? AND expires>?',
+        rows=self._read('SELECT * FROM callbacks WHERE token=? AND tid=? AND generation=? AND (expires=0 OR expires>?)',
                         (token[2:],tid,generation,time.time()))
         if not rows:return None
         stage=getattr(self.local,'stage',None)
@@ -121,6 +123,10 @@ class Store:
         self._write('UPDATE callbacks SET done=1 WHERE token=?',(token[2:],))
 
     def enqueue(self,method,payload,tid=None,generation=None,task_ids=()):
+        if method == 'menu' and not payload.get('_new_menu') and not payload.get('_menu_message_id'):
+            pending = self._read("SELECT payload FROM outgoing WHERE method='menu' AND tid=? ORDER BY id DESC LIMIT 1", (tid,))
+            if pending and json.loads(pending[0]['payload']).get('_new_menu'):
+                payload = {**payload, '_new_menu': json.loads(pending[0]['payload'])['_new_menu']}
         self._write('INSERT INTO outgoing(method,payload,tid,generation,task_ids,next_at) VALUES(?,?,?,?,?,?)',
                     (method,json.dumps(payload,ensure_ascii=False),tid,generation,json.dumps(list(task_ids)),time.time()))
 
@@ -133,8 +139,14 @@ class Store:
         rows=self._read('SELECT message_id FROM menus WHERE chat_id=?',(chat_id,))
         return rows[0]['message_id'] if rows else None
 
-    def menu_sent(self,row_id,chat_id,message_id):
+    def menu_session(self,chat_id,session):
+        rows=self._read('SELECT message_id FROM menu_sessions WHERE session=?',(str(chat_id)+':'+str(session),))
+        return rows[0]['message_id'] if rows else None
+
+    def menu_sent(self,row_id,chat_id,message_id,session=None):
         with self.transaction() as db:
+            if session:
+                db.execute('INSERT OR REPLACE INTO menu_sessions VALUES(?,?)',(str(chat_id)+':'+str(session),message_id))
             db.execute('INSERT INTO menus VALUES(?,?) ON CONFLICT(chat_id) DO UPDATE SET message_id=excluded.message_id',
                        (chat_id,message_id))
             self.delivered(row_id)

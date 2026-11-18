@@ -18,7 +18,7 @@ class FakeBackend:
         self.can_manage=True
         self.can_delete=True
         self.tasks=[{'id':1,'title':'План','description':'Описание','deadline':'2030-01-02','version':1,
-                     'completed':False,'assignee_ids':[7],'creator_name':'Иван','creator_id':8,'can_change_status':True,'departments':[{'title':'IT'}],'event':None}]
+                     'archived':False,'assignees':[],'department_card_ids':[],'event_card_id':None,'completed':False,'assignee_ids':[7],'creator_name':'Иван','creator_id':8,'can_change_status':True,'departments':[{'title':'IT'}],'event':None}]
         self.items=[{'id':2,'name':'Микрофон','description':'Рабочий','version':1,'holder_user':None,
                      'location':{'id':1,'name':'В правке'},'taken_at':None}]
     def request(self,method,path,body=None,*,tid=None,request_id=None,generation=None):
@@ -26,14 +26,17 @@ class FakeBackend:
         if path.split('?')[0]=='bot/me':
             if not self.linked:raise ApiError(403,'Привяжите аккаунт')
             return {'user_id':7,'name':'Анна','generation':self.generation,'login':'anna'}
+        if path=='bot/events':return []
         if path=='bot/claim':return {'pending':True}
         if path.endswith('/preferences/notifications'):
             if method=='PUT':self.preferences[path]=body['enabled']
             return {'enabled':self.preferences.get(path,True)}
+        if path=='bot/tasks/options':return {'users':[{'id':7,'name':'Анна','login':'anna'}],'events':[],'departments':[]}
+        if path=='bot/tasks?scope=all':return self.tasks
         if path=='bot/tasks?include_created=true&include_completed=true':return self.tasks
         if path=='bot/tasks?include_created=true':return [t for t in self.tasks if not t['completed']]
         if path=='bot/tasks/1':
-            if method=='PATCH':self.tasks[0]['completed']=body['completed']
+            if method=='PATCH':self.tasks[0].update(body)
             return self.tasks[0]
         if path=='bot/equipment/options':return {'can_manage':self.can_manage,'can_delete':self.can_delete,'default_location_id':1,
             'users':[{'id':7,'name':'Анна','login':'anna'}], 'locations':[{'id':1,'name':'В правке'}]}
@@ -105,6 +108,42 @@ class ChatTests(unittest.TestCase):
         self.assertIn('В архиве',payload['text'])
         self.assertNotIn('Выполнено',str(payload['reply_markup']))
         self.assertNotIn('Вернуть в работу',str(payload['reply_markup']))
+
+    def test_section_commands_always_open_distinct_menus_including_binding_links(self):
+        self.store.menu_sent(-1,101,37)
+        sessions=set()
+        for command in ['/start','/start','/start link_'+'x'*43,'/tasks','/tasks','/equipment','/zones','/link','/help','/unlink','/cancel']:
+            self.message(command)
+            session=self.replies()[-1]['payload']['_new_menu']
+            self.assertNotIn(session,sessions)
+            sessions.add(session)
+
+    def test_text_input_updates_the_menu_where_the_form_was_started(self):
+        self.store.menu_sent(-1,101,80)
+        token=self.store.callback(101,self.backend.generation,{'kind':'task_new','menu':True})
+        self.chat.process({'update_id':71,'callback_query':{'id':'q','from':{'id':101},
+            'message':{'message_id':40,'chat':{'id':101,'type':'private'}},'data':token}})
+        self.message('Новая таска')
+        self.assertEqual(self.replies()[-1]['payload']['_menu_message_id'],40)
+        self.assertNotIn('_new_menu',self.replies()[-1]['payload'])
+
+    def test_task_draft_validates_deadline_preserves_version_and_cancels(self):
+        self.message('/tasks')
+        self.button('Все доступные таски')
+        self.button('План')
+        self.button('Редактировать таску')
+        self.button('Дедлайн')
+        self.message('31.02.2027')
+        self.assertIn('ДД.ММ.ГГГГ',self.replies()[-1]['payload']['text'])
+        self.message('01.12.2027')
+        self.button('Сохранить изменения')
+        mutation=next(c for c in self.backend.calls if c[0]=='PATCH')
+        self.assertEqual(mutation[2],{'version':1,'deadline':'2027-12-01'})
+        self.message('/tasks')
+        self.button('Создать таску')
+        self.message('Отменённая')
+        self.message('/cancel')
+        self.assertFalse(any(c[0]=='POST' and c[1]=='bot/tasks' for c in self.backend.calls))
 
     def test_group_updates_do_not_read_member_data(self):
         self.message('/tasks',chat_type='group')
