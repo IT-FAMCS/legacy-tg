@@ -53,17 +53,22 @@ class IntegrationTests(unittest.TestCase):
     def message(self,text,tid=None):
         self.tid=tid or self.tid;self.counter+=1
         self.chat.process({'update_id':self.counter,'message':{'from':{'id':self.tid},'chat':{'id':self.tid,'type':'private'},'text':text}})
-    def button(self,text):
+    def button_token(self,text):
         for row in reversed(self.store.outgoing()):
             if row['tid']!=self.tid:continue
             for buttons in row['payload'].get('reply_markup',{}).get('inline_keyboard',[]):
                 for button in buttons:
                     if text in button['text']:
-                        self.counter+=1
-                        self.chat.process({'update_id':self.counter,'callback_query':{'id':str(self.counter),'from':{'id':self.tid},
-                            'message':{'chat':{'id':self.tid,'type':'private'}},'data':button['callback_data']}})
-                        return
+                        return button['callback_data']
         self.fail('Missing button '+text+'; '+str(self.store.outgoing()[-2:]))
+
+    def click(self,token):
+        self.counter+=1
+        self.chat.process({'update_id':self.counter,'callback_query':{'id':str(self.counter),'from':{'id':self.tid},
+            'message':{'chat':{'id':self.tid,'type':'private'}},'data':token}})
+
+    def button(self,text):
+        self.click(self.button_token(text))
 
     def test_full_equipment_lifecycle_uses_real_permissions_and_history(self):
         self.message('/equipment');self.button('Добавить предмет');self.message('Проектор');self.message('Для лекций')
@@ -85,19 +90,31 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(self.db.query(models.EquipmentHistory).filter_by(item_id=item.id).count(),4)
 
     def test_own_task_completion_and_notification_assignment_removal(self):
-        task=self.create_task(assignee_ids=[self.users['Участник']])
+        author='Заместитель председателя по IT'
+        status,task=self.web('POST','/api/tasks',{'title':'Таска для Telegram','assignee_ids':[self.users['Участник']]},role=author)
+        self.assertEqual(status,201,task)
         telegram=Telegram();worker=DeliveryWorker(self.backend,telegram,self.store)
         worker.notifications();self.assertIn('назначена',telegram.sent[-1][1]['text'])
-        self.web('PATCH',f"/api/tasks/{task['id']}",{'version':1,'assignee_ids':[]})
+        self.web('PATCH',f"/api/tasks/{task['id']}",{'version':1,'assignee_ids':[]},role=author)
         worker.notifications();self.assertIn('сняли',telegram.sent[-1][1]['text'])
-        status,task=self.web('PATCH',f"/api/tasks/{task['id']}",{'version':2,'assignee_ids':[self.users['Участник']]})
+        status,task=self.web('PATCH',f"/api/tasks/{task['id']}",{'version':2,'assignee_ids':[self.users['Участник']]},role=author)
         self.message('/tasks',tid=101);self.button('Таска для Telegram');self.button('Выполнено')
         self.db.expire_all();self.assertTrue(self.db.get(models.Task,task['id']).completed)
         self.assertEqual(self.db.query(models.TaskHistory).filter_by(task_id=task['id']).count(),4)
 
+        self.message('/tasks',tid=202)
+        self.button('Выполненные таски')
+        self.button('Таска для Telegram')
+        self.button('Отключить уведомления по таске')
+        self.button('Вернуть в работу')
+        self.db.expire_all()
+        self.assertFalse(self.db.get(models.Task,task['id']).completed)
+        self.assertFalse(self.bot('GET',f"bot/tasks/{task['id']}/preferences/notifications",tid=202)[1]['enabled'])
+
     def test_role_revoked_mid_wizard_and_cancelled_callback_do_not_mutate(self):
         self.message('/equipment');self.button('Добавить предмет');self.message('Не сохранять');self.message('/skip')
-        self.message('/cancel');self.button('Создать')
+        stale=self.button_token('Создать')
+        self.message('/cancel');self.click(stale)
         self.assertEqual(self.db.query(models.EquipmentItem).count(),0)
         self.message('/equipment');self.button('Добавить предмет');self.message('Запрещённый');self.message('/skip')
         user=self.db.get(models.User,self.users['Заместитель председателя по IT'])
@@ -110,7 +127,7 @@ class IntegrationTests(unittest.TestCase):
         self.message('/zones',tid=101);self.button('Посвящение');self.button('Добавить зону')
         self.message('Сцена');self.message('2');self.button('Создать зону')
         self.button('Назначить главного');self.button('Участник Имя')
-        self.button('Помогаторы');self.button('Искать человека');self.button('Искать человека');self.button('Другой участник Имя');self.button('Сохранить помогаторов')
+        self.button('Помогаторы');self.button('Искать человека');self.message('Другой участник');self.button('Другой участник Имя');self.button('Сохранить помогаторов')
         board=self.web('GET',f"/api/cards/{self.cards['Посвящение']}/responsibility-zones")[1]
         self.assertEqual(board['closed'],1)
         self.assertEqual(board['zones'][0]['lead_user_id'],self.users['Участник'])

@@ -18,6 +18,14 @@ class Store:
             CREATE TABLE IF NOT EXISTS drafts(tid INTEGER PRIMARY KEY,generation TEXT NOT NULL,data TEXT NOT NULL,expires REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS callbacks(token TEXT PRIMARY KEY,tid INTEGER NOT NULL,generation TEXT NOT NULL,data TEXT NOT NULL,expires REAL NOT NULL,done INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS outgoing(id INTEGER PRIMARY KEY,method TEXT NOT NULL,payload TEXT NOT NULL,tid INTEGER,generation TEXT,task_ids TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,next_at REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS menus(chat_id INTEGER PRIMARY KEY,message_id INTEGER NOT NULL);
+            CREATE TRIGGER IF NOT EXISTS latest_menu AFTER INSERT ON outgoing WHEN NEW.method='menu'
+            BEGIN
+                DELETE FROM outgoing WHERE method='menu' AND tid=NEW.tid AND id<NEW.id;
+            END;
+            UPDATE outgoing SET method='menu' WHERE method='sendMessage' AND tid IS NOT NULL;
+            DELETE FROM outgoing WHERE method='menu' AND id NOT IN
+                (SELECT MAX(id) FROM outgoing WHERE method='menu' GROUP BY tid);
             ''')
 
     @contextmanager
@@ -120,6 +128,16 @@ class Store:
         rows=self._read('SELECT * FROM outgoing'+(' WHERE next_at<=?' if due_only else '')+' ORDER BY id LIMIT 100',
                         (time.time(),) if due_only else ())
         return [{**dict(row),'payload':json.loads(row['payload']),'task_ids':json.loads(row['task_ids'])} for row in rows]
+
+    def menu_message(self,chat_id):
+        rows=self._read('SELECT message_id FROM menus WHERE chat_id=?',(chat_id,))
+        return rows[0]['message_id'] if rows else None
+
+    def menu_sent(self,row_id,chat_id,message_id):
+        with self.transaction() as db:
+            db.execute('INSERT INTO menus VALUES(?,?) ON CONFLICT(chat_id) DO UPDATE SET message_id=excluded.message_id',
+                       (chat_id,message_id))
+            self.delivered(row_id)
 
     def delivered(self,row_id):self._write('DELETE FROM outgoing WHERE id=?',(row_id,))
 

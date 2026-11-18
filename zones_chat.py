@@ -33,14 +33,17 @@ class ZonesMixin:
         rows.append([self.button('История зон','zone_history',event_id=event_id),self.button('К мероприятиям','zone_events')])
         self.zone_reply(event_id,f"{board['card']['title'][:300]}\nЗон: {board['total']} · закрыто: {board['closed']} · не закрыто: {board['open']}\nГлавный входит в нужное число людей.",rows)
 
-    def zone_detail(self,event_id,zone_id):
+    def zone_detail(self,event_id,zone_id,page=0):
         board=self.zone_board(event_id);zone=self.zone_find(board,zone_id)
-        helpers='\n'.join(self.zone_person(p) for p in zone['helpers']) or 'Пока никого'
+        people=zone['helpers']
+        page=max(0,min(page,max(0,(len(people)-1)//5)))
+        helpers='\n'.join(self.zone_person(p) for p in people[page*5:(page+1)*5]) or 'Пока никого'
         rows=[]
         if board['can_edit']:
             rows=[[self.button('Назначить главного','zone_lead',event_id=event_id,id=zone_id),self.button('Помогаторы','zone_helpers',event_id=event_id,id=zone_id)],
                   [self.button('Название','zone_field',event_id=event_id,id=zone_id,field='title'),self.button('Нужно людей','zone_field',event_id=event_id,id=zone_id,field='people_required')],
                   [self.button('Удалить зону','zone_delete_confirm',event_id=event_id,id=zone_id)]]
+        self.pagination(rows,page,len(people),'zone_detail',event_id=event_id,id=zone_id)
         rows.append([self.button('К зонам мероприятия','zone_list',event_id=event_id)])
         self.zone_reply(event_id,f"{zone['title']}\nЛюди: {zone['filled']} / {zone['people_required']} · {'Закрыта' if zone['closed'] else 'Не закрыта'}\n\nГлавный: {self.zone_person(zone['lead'])}\n\nПомогаторы:\n{helpers}",rows)
 
@@ -67,11 +70,11 @@ class ZonesMixin:
         event_id=data.get('event_id');zone_id=data.get('id');page=data.get('page',0)
         if kind=='zone_events':self.events(page)
         elif kind=='zone_list':self.zones(event_id,page)
-        elif kind=='zone_detail':self.zone_detail(event_id,zone_id)
+        elif kind=='zone_detail':self.zone_detail(event_id,zone_id,page)
         elif kind=='zone_history':
-            rows=self.api('GET',self.zone_path(event_id)+'/history');subset=rows[page*5:(page+1)*5]
+            rows=self.api('GET',self.zone_path(event_id)+'/history');subset=rows[page*2:(page+1)*2]
             text='История зон\n\n'+'\n\n'.join(f"{r['action']} · {(r['after'] or r['before'])['title']}\n{r['actor_name']} · {r['created_at']}\nБыло: {self.zone_person((r['before'] or {}).get('lead'))}\nСтало: {self.zone_person((r['after'] or {}).get('lead'))}" for r in subset)
-            buttons=[];self.pagination(buttons,page,len(rows),'zone_history',event_id=event_id);buttons.append([self.button('К зонам мероприятия','zone_list',event_id=event_id)])
+            buttons=[];self.pagination(buttons,page,len(rows),'zone_history',per_page=2,event_id=event_id);buttons.append([self.button('К зонам мероприятия','zone_list',event_id=event_id)])
             self.zone_reply(event_id,text,buttons)
         elif kind in {'zone_new','zone_field','zone_lead','zone_helpers'}:
             board=self.zone_board(event_id,True);flow=secrets.token_hex(8)

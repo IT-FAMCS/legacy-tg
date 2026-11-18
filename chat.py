@@ -43,23 +43,32 @@ class Chat(ZonesMixin):
     def generation(self):return self.me['generation'] if self.me else ''
 
     def button(self,text,kind,**values):
-        return {'text':clip(text,55),'callback_data':self.store.callback(self.tid,self.generation,{'kind':kind,**values})}
+        style='primary'
+        if kind in {'complete','take','save_draft','zone_save','zone_save_helpers'}:
+            style='success'
+        elif kind in {'delete','delete_confirm','unlink','zone_delete','zone_delete_confirm','zone_clear','zone_clear_confirm'}:
+            style='danger'
+        elif kind=='notifications':
+            style='success' if values['enabled'] else 'danger'
+        return {'text':clip(text,55),'style':style,
+                'callback_data':self.store.callback(self.tid,self.generation,{'kind':kind,**values})}
 
     def reply(self,text,rows=None,task_ids=()):
-        parts=chunks(text,3500)
-        for index,part in enumerate(parts):
-            payload={'chat_id':self.tid,'text':part,'link_preview_options':{'is_disabled':True}}
-            if rows and index==len(parts)-1:payload['reply_markup']={'inline_keyboard':rows}
-            self.store.enqueue('sendMessage',payload,self.tid,self.generation or None,task_ids)
+        if self.notice:
+            text=self.notice+'\n\n'+text
+            self.notice=''
+        payload={'chat_id':self.tid,'text':text,'link_preview_options':{'is_disabled':True}}
+        if rows:payload['reply_markup']={'inline_keyboard':rows}
+        self.store.enqueue('menu',payload,self.tid,self.generation or None,task_ids)
 
     def main_menu(self,text='Наследие · выберите раздел'):
         self.reply(text,[[self.button('Мои таски','tasks')],[self.button('Оборудка','equipment')],[self.button('Мероприятия · зоны','zone_events')],
-                         [{'text':'Открыть Наследие','url':self.webapp_url}],
+                         [{'text':'Открыть Наследие','style':'primary','url':self.webapp_url}],
                          [self.button('Привязка аккаунта','link')]])
 
     def link_prompt(self):
         self.reply('Привязать аккаунт: откройте свой профиль Наследия, войдите обычным способом и создайте ссылку Telegram. После открытия бота подтвердите привязку на сайте. Пароль в этот чат отправлять не нужно.',
-                   [[{'text':'Привязать аккаунт','url':self.webapp_url+'/account'}]])
+                   [[{'text':'Привязать аккаунт','style':'primary','url':self.webapp_url+'/account'}]])
 
     def process(self,update):
         update_id=update.get('update_id')
@@ -73,7 +82,7 @@ class Chat(ZonesMixin):
             tid=sender.get('id')
             if type(tid) is not int or tid<=0 or chat.get('type')!='private' or chat.get('id')!=tid or sender.get('is_bot'):
                 self.store.finish(update_id);return
-            self.tid=tid;self.me=None;self.request_id=f'update:{update_id}'
+            self.tid=tid;self.me=None;self.notice='';self.request_id=f'update:{update_id}'
             text=message.get('text') or ''
             command=text.split(maxsplit=1)[0].split('@')[0] if text else ''
             try:
@@ -84,16 +93,16 @@ class Chat(ZonesMixin):
                     self.api('POST','bot/claim',{'token':token,'telegram_user_id':tid,'chat_id':tid,
                         'username':sender.get('username'),'display_name':' '.join(filter(None,[sender.get('first_name'),sender.get('last_name')]))})
                     self.reply('Telegram найден. Вернитесь в профиль Наследия и подтвердите привязку. Затем нажмите /start.');self.store.finish(update_id);return
+                if callback:self.store.enqueue('answerCallbackQuery',{'callback_query_id':callback['id']})
                 try:self.me=self.api('GET','bot/me?contact=true')
                 except ApiError as error:
                     if error.status!=403:raise
                     self.store.set_state(tid,'',None);self.link_prompt();self.store.finish(update_id);return
                 if callback:
-                    self.store.enqueue('answerCallbackQuery',{'callback_query_id':callback['id']})
                     token=callback.get('data','')
                     entry=self.store.action(token,tid,self.generation)
-                    if not entry:self.reply('Кнопка устарела или принадлежит другому аккаунту. Откройте /tasks или /equipment.')
-                    elif entry['done']:self.reply('Это действие уже выполнено. Откройте актуальный список.');
+                    if not entry:self.main_menu('Кнопка устарела. Выберите раздел.')
+                    elif entry['done']:self.main_menu('Это действие уже выполнено. Выберите раздел.')
                     else:
                         self.request_id='callback:'+token
                         self.action(entry['data'],token)
@@ -104,7 +113,7 @@ class Chat(ZonesMixin):
                     if command=='/tasks':self.tasks()
                     elif command=='/equipment':self.equipment()
                     elif command=='/zones':self.events()
-                    elif command=='/link':self.reply(f"Аккаунт привязан: {self.me['name']}. Отключить: /unlink.",[[{'text':'Профиль','url':self.webapp_url+'/account'}]])
+                    elif command=='/link':self.reply(f"Аккаунт привязан: {self.me['name']}. Отключить: /unlink.",[[{'text':'Профиль','style':'primary','url':self.webapp_url+'/account'}]])
                     elif command=='/unlink':self.reply('Отключить Telegram от аккаунта Наследия?',[[self.button('Отключить','unlink')],[self.button('Отмена','menu')]])
                     else:self.main_menu('Наследие · таски и оборудка в чате.\n/tasks — свои таски\n/equipment — оборудка\n/zones — зоны мероприятий\n/cancel — отменить ввод\n/unlink — отключить аккаунт')
                 else:self.text(text)
@@ -113,31 +122,55 @@ class Chat(ZonesMixin):
                 if error.status in {403,404,409,410}:self.store.set_state(tid,self.generation,None)
             self.store.finish(update_id)
 
-    def tasks(self,page=0):
-        tasks=self.api('GET','bot/tasks');page=max(0,min(page,max(0,(len(tasks)-1)//PAGE)))
+    def preference_path(self,task_id):
+        scope=f'/{task_id}' if task_id is not None else ''
+        return f'bot/tasks{scope}/preferences/notifications'
+
+    def notification_button(self,task_id=None,page=0,completed=False):
+        enabled=self.api('GET',self.preference_path(task_id))['enabled']
+        action='Отключить' if enabled else 'Включить'
+        scope='уведомления по таске' if task_id is not None else 'все уведомления о тасках'
+        return self.button(f'{action} {scope}','notifications',id=task_id,page=page,completed=completed,enabled=not enabled)
+
+    def tasks(self,page=0,completed=False):
+        path='bot/tasks?include_created=true'
+        if completed:path+='&include_completed=true'
+        tasks=[task for task in self.api('GET',path) if task['completed']==completed]
+        page=max(0,min(page,max(0,(len(tasks)-1)//PAGE)))
         subset=tasks[page*PAGE:(page+1)*PAGE]
         rows=[[self.button(task['title'],'task',id=task['id'])] for task in subset]
-        self.pagination(rows,page,len(tasks),'tasks')
+        self.pagination(rows,page,len(tasks),'tasks',completed=completed)
+        rows.append([self.button('К действующим таскам' if completed else 'Выполненные таски','tasks',completed=not completed)])
+        rows.append([self.notification_button(page=page,completed=completed)])
         rows.append([self.button('Главное меню','menu')])
-        self.reply(f'Мои действующие таски · {len(tasks)}\nВыберите таску.' if tasks else 'Действующих тасок нет.',rows,[task['id'] for task in subset])
+        label='Выполненные таски' if completed else 'Мои действующие таски'
+        text=f'{label} · {len(tasks)}'
+        if tasks:text+='\nВыберите таску.'
+        self.reply(text,rows,[task['id'] for task in subset])
 
-    def pagination(self,rows,page,total,kind,**values):
+    def pagination(self,rows,page,total,kind,per_page=PAGE,**values):
         navigation=[]
         if page>0:navigation.append(self.button('← Назад',kind,page=page-1,**values))
-        if (page+1)*PAGE<total:navigation.append(self.button('Далее →',kind,page=page+1,**values))
+        if (page+1)*per_page<total:navigation.append(self.button('Далее →',kind,page=page+1,**values))
         if navigation:rows.append(navigation)
 
     def task(self,task_id,page=0):
         task=self.api('GET',f'bot/tasks/{task_id}')
         pieces=chunks(task.get('description') or 'Без описания',1400);page=max(0,min(page,len(pieces)-1))
         text=f"{clip(task['title'],500)}\nДедлайн: {task.get('deadline') or 'без срока'}\n"
+        status='В архиве' if task.get('archived') else 'Выполнена' if task['completed'] else 'В работе'
+        text+='Статус: '+status+'\n'
+        text+='Создатель: '+clip(task.get('creator_name') or 'Не указан',200)+'\n'
         text+='Отделы: '+clip(', '.join(d['title'] for d in task.get('departments',[])) or '—',300)+'\n'
         text+='Мероприятие: '+clip((task.get('event') or {}).get('title','—'),200)+'\n\n'+pieces[page]
         rows=[]
-        if not task.get('completed'):rows.append([self.button('Выполнено','complete',id=task_id,version=task['version'])])
+        if task['can_change_status'] and not task.get('archived'):
+            label='Вернуть в работу' if task['completed'] else 'Выполнено'
+            rows.append([self.button(label,'complete',id=task_id,version=task['version'],completed=not task['completed'])])
         if page>0:rows.append([self.button('← Описание','task',id=task_id,page=page-1)])
         if page+1<len(pieces):rows.append([self.button('Описание далее →','task',id=task_id,page=page+1)])
-        rows.append([self.button('К моим таскам','tasks')])
+        rows.append([self.notification_button(task_id,page)])
+        rows.append([self.button('К моим таскам','tasks',completed=task['completed'])])
         self.reply(text,rows,[task_id])
 
     def equipment(self,page=0,query=''):
@@ -219,18 +252,26 @@ class Chat(ZonesMixin):
         if self.zone_action(data,token):return
         kind=data['kind'];page=data.get('page',0);item_id=data.get('id')
         if kind=='menu':self.main_menu()
-        elif kind=='link':self.reply('Управление привязкой: /link или /unlink.',[[{'text':'Профиль','url':self.webapp_url+'/account'}]])
-        elif kind=='tasks':self.tasks(page)
+        elif kind=='link':self.reply('Управление привязкой: /link или /unlink.',[[{'text':'Профиль','style':'primary','url':self.webapp_url+'/account'}]])
+        elif kind=='tasks':self.tasks(page,data.get('completed',False))
         elif kind=='task':self.task(item_id,page)
+        elif kind=='notifications':
+            self.api('PUT',self.preference_path(item_id),{'enabled':data['enabled']})
+            self.store.done(token)
+            if item_id is None:self.tasks(page,data.get('completed',False))
+            else:self.task(item_id,page)
         elif kind=='complete':
-            self.api('PATCH',f'bot/tasks/{item_id}',{'version':data['version'],'completed':True})
-            self.store.done(token);self.reply('Таска выполнена.');self.tasks()
+            completed=data.get('completed',True)
+            self.api('PATCH',f'bot/tasks/{item_id}',{'version':data['version'],'completed':completed})
+            self.store.done(token)
+            self.notice='Таска выполнена.' if completed else 'Таска возвращена в работу.'
+            self.task(item_id)
         elif kind=='equipment':self.equipment(page,data.get('query',''))
         elif kind=='item':self.item(item_id,page)
         elif kind=='history':self.history(item_id,page)
         elif kind=='take':
             self.api('POST',f'bot/equipment/{item_id}/take',{'version':data['version']})
-            self.store.done(token);self.reply('Предмет записан на вас. Время выставлено автоматически.');self.item(item_id)
+            self.store.done(token);self.notice='Предмет записан на вас. Время выставлено автоматически.';self.item(item_id)
         elif kind=='search':self.set_state({'kind':'equipment_search'});self.reply('Введите название или описание для поиска. /cancel — отмена.')
         elif kind=='create':
             self.options_manager();self.set_state({'kind':'create_name','mode':'create','flow':secrets.token_hex(8),'payload':{}})
@@ -266,16 +307,16 @@ class Chat(ZonesMixin):
                 self.options_manager()
                 path='bot/equipment'+('' if state['mode']=='create' else '/'+str(state['id']))
                 result=self.api('POST' if state['mode']=='create' else 'PATCH',path,state['payload'])
-                self.store.done(token);self.set_state(None);self.reply('Предмет сохранён.');self.item(result['id'])
+                self.store.done(token);self.set_state(None);self.notice='Предмет сохранён.';self.item(result['id'])
         elif kind=='delete_confirm':
             options=self.api('GET','bot/equipment/options')
             if not options['can_delete']:raise ApiError(403,'Удаление недоступно для вашей роли')
             item=self.get_item(item_id)
             self.reply(f"Удалить «{clip(item['name'],300)}» из списка? История сохранится.",[[self.button('Удалить','delete',id=item_id,version=item['version'])],[self.button('Отмена','item',id=item_id)]])
         elif kind=='delete':
-            self.api('DELETE',f'bot/equipment/{item_id}',{'version':data['version']});self.store.done(token);self.reply('Предмет удалён. История сохранена.');self.equipment()
+            self.api('DELETE',f'bot/equipment/{item_id}',{'version':data['version']});self.store.done(token);self.notice='Предмет удалён. История сохранена.';self.equipment()
         elif kind=='unlink':
-            self.api('POST','bot/unlink',{});self.store.done(token);self.set_state(None);self.me=None;self.reply('Telegram отключён от Наследия.');self.link_prompt()
+            self.api('POST','bot/unlink',{});self.store.done(token);self.set_state(None);self.me=None;self.notice='Telegram отключён от Наследия.';self.link_prompt()
         elif kind=='cancel':self.set_state(None);self.main_menu('Изменения отменены.')
         else:self.reply('Кнопка устарела. Начните с /start.')
 

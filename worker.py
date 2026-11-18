@@ -21,8 +21,11 @@ class DeliveryWorker:
                         self.store.delivered(row['id']);continue
                     for task_id in row['task_ids']:
                         self.backend.request('GET',f'bot/events/{task_id[6:]}/responsibility-zones' if isinstance(task_id,str) and task_id.startswith('event:') else f'bot/tasks/{task_id}',tid=row['tid'],generation=row['generation'])
-                self.telegram.call(row['method'],row['payload'])
-                self.store.delivered(row['id'])
+                if row['method']=='menu':
+                    self.deliver_menu(row)
+                else:
+                    self.telegram.call(row['method'],row['payload'])
+                    self.store.delivered(row['id'])
             except ApiError as error:
                 if error.status in {403,404,410}:self.store.delivered(row['id'])
                 else:self.store.retry(row['id'],30)
@@ -41,6 +44,27 @@ class DeliveryWorker:
                 else:self.store.retry(row['id'],error.retry_after or min(3600,5*2**min(row['attempts'],8)))
             except TransportError:self.store.retry(row['id'],min(3600,5*2**min(row['attempts'],8)))
 
+    def deliver_menu(self,row):
+        payload=row['payload']
+        chat_id=payload['chat_id']
+        message_id=self.store.menu_message(chat_id)
+        if message_id:
+            try:
+                self.telegram.call('editMessageText',{**payload,'message_id':message_id})
+            except TelegramError as error:
+                if error.reason=='unchanged':
+                    self.store.delivered(row['id'])
+                    return
+                if error.reason!='missing':
+                    raise
+            else:
+                self.store.delivered(row['id'])
+                return
+        result=self.telegram.call('sendMessage',payload)
+        if not isinstance(result,dict) or type(result.get('message_id')) is not int or result['message_id']<=0:
+            raise TransportError('Telegram did not return a menu message ID')
+        self.store.menu_sent(row['id'],chat_id,result['message_id'])
+
     def notifications(self):
         if not self.store.sending_allowed():return
         # A single leased entry avoids exhausting its lease behind slow API calls.
@@ -58,7 +82,7 @@ class DeliveryWorker:
                         # Validate current assignment/access again immediately before the external send.
                         self.backend.request('GET',f"bot/tasks/{row['task_id']}",tid=row['telegram_user_id'],generation=row['generation'])
                         token=self.store.callback(row['telegram_user_id'],row['generation'],{'kind':'task','id':row['task_id']})
-                        payload['reply_markup']={'inline_keyboard':[[{'text':'Открыть таску','callback_data':token}]]}
+                        payload['reply_markup']={'inline_keyboard':[[{'text':'Открыть таску','style':'primary','callback_data':token}]]}
                     self.telegram.call('sendMessage',payload)
             except ApiError as error:
                 outcome='permanent' if error.status in {403,404,410} else 'retry'

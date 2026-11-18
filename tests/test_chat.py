@@ -14,10 +14,11 @@ class FakeBackend:
         self.calls=[]
         self.linked=True
         self.generation='generation-1'
+        self.preferences={}
         self.can_manage=True
         self.can_delete=True
         self.tasks=[{'id':1,'title':'План','description':'Описание','deadline':'2030-01-02','version':1,
-                     'completed':False,'departments':[{'title':'IT'}],'event':None}]
+                     'completed':False,'assignee_ids':[7],'creator_name':'Иван','creator_id':8,'can_change_status':True,'departments':[{'title':'IT'}],'event':None}]
         self.items=[{'id':2,'name':'Микрофон','description':'Рабочий','version':1,'holder_user':None,
                      'location':{'id':1,'name':'В правке'},'taken_at':None}]
     def request(self,method,path,body=None,*,tid=None,request_id=None,generation=None):
@@ -26,9 +27,13 @@ class FakeBackend:
             if not self.linked:raise ApiError(403,'Привяжите аккаунт')
             return {'user_id':7,'name':'Анна','generation':self.generation,'login':'anna'}
         if path=='bot/claim':return {'pending':True}
-        if path=='bot/tasks':return [t for t in self.tasks if not t['completed']]
+        if path.endswith('/preferences/notifications'):
+            if method=='PUT':self.preferences[path]=body['enabled']
+            return {'enabled':self.preferences.get(path,True)}
+        if path=='bot/tasks?include_created=true&include_completed=true':return self.tasks
+        if path=='bot/tasks?include_created=true':return [t for t in self.tasks if not t['completed']]
         if path=='bot/tasks/1':
-            if method=='PATCH':self.tasks[0]['completed']=True
+            if method=='PATCH':self.tasks[0]['completed']=body['completed']
             return self.tasks[0]
         if path=='bot/equipment/options':return {'can_manage':self.can_manage,'can_delete':self.can_delete,'default_location_id':1,
             'users':[{'id':7,'name':'Анна','login':'anna'}], 'locations':[{'id':1,'name':'В правке'}]}
@@ -71,6 +76,35 @@ class ChatTests(unittest.TestCase):
                         self.chat.process(update)
                         return update
         raise AssertionError('Button not found: '+label)
+
+    def test_creator_can_control_notifications_and_reopen_completed_task(self):
+        self.backend.tasks[0].update(assignee_ids=[],creator_id=7)
+        self.message('/tasks')
+        self.button('Отключить все уведомления')
+        self.assertFalse(self.backend.preferences['bot/tasks/preferences/notifications'])
+        self.button('План')
+        self.assertIn('Создатель: Иван', self.replies()[-1]['payload']['text'])
+        self.button('Отключить уведомления по таске')
+        self.assertFalse(self.backend.preferences['bot/tasks/1/preferences/notifications'])
+        self.button('Включить уведомления по таске')
+        self.assertTrue(self.backend.preferences['bot/tasks/1/preferences/notifications'])
+
+        self.button('Выполнено')
+        self.message('/tasks')
+        self.button('Выполненные таски')
+        self.button('План')
+        self.button('Вернуть в работу')
+        self.assertFalse(self.backend.tasks[0]['completed'])
+        self.assertIn('Таска возвращена в работу.',self.replies()[-1]['payload']['text'])
+
+    def test_archived_task_status_is_read_only(self):
+        self.backend.tasks[0].update(archived=True,can_change_status=False)
+        self.message('/tasks')
+        self.button('План')
+        payload=self.replies()[-1]['payload']
+        self.assertIn('В архиве',payload['text'])
+        self.assertNotIn('Выполнено',str(payload['reply_markup']))
+        self.assertNotIn('Вернуть в работу',str(payload['reply_markup']))
 
     def test_group_updates_do_not_read_member_data(self):
         self.message('/tasks',chat_type='group')

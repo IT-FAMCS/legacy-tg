@@ -49,6 +49,59 @@ class WorkerTests(unittest.TestCase):
         self.temp=tempfile.TemporaryDirectory();self.store=Store(str(Path(self.temp.name)/'bot.db'))
         self.telegram=FakeTelegram();self.backend=FakeBackend();self.worker=DeliveryWorker(self.backend,self.telegram,self.store)
     def tearDown(self):self.store.close();self.temp.cleanup()
+    def test_menu_remembers_message_after_restart_and_replaces_deleted_message(self):
+        def screen(label):
+            self.store.enqueue('menu',{'chat_id':101,'text':label},101)
+            self.worker.flush_replies()
+        screen('one')
+        self.store=Store(self.store.path)
+        self.worker=DeliveryWorker(self.backend,self.telegram,self.store)
+        screen('two')
+        self.assertEqual(self.telegram.calls[-1],('editMessageText',{'chat_id':101,'message_id':1,'text':'two'}))
+        original=self.telegram.call
+        def missing(method,payload):
+            if method=='editMessageText':
+                raise TelegramError(400,reason='missing')
+            return original(method,payload)
+        self.telegram.call=missing
+        screen('three')
+        self.assertEqual(self.telegram.calls[-1][0],'sendMessage')
+        self.assertEqual(self.store.outgoing(),[])
+
+    def test_inflight_menu_send_and_notification_keep_new_screen_address(self):
+        self.store.enqueue('menu',{'chat_id':101,'text':'first'},101)
+        original=self.telegram.call
+        def interleaved(method,payload):
+            original(method,payload)
+            self.store.enqueue('menu',{'chat_id':101,'text':'latest'},101)
+            return {'message_id':41}
+        self.telegram.call=interleaved
+        self.worker.flush_replies()
+        self.telegram.call=original
+        self.backend.rows=[{'id':2,'lease_token':'lease','chat_id':101,'telegram_user_id':101,
+                            'generation':'old','task_id':7,'kind':'updated','text':'edited'}]
+        self.worker.notifications()
+        self.worker.flush_replies()
+        self.assertEqual([method for method,_ in self.telegram.calls],['sendMessage','sendMessage','editMessageText'])
+        self.assertEqual(self.telegram.calls[-1][1]['message_id'],41)
+        self.assertEqual(self.telegram.calls[-1][1]['text'],'latest')
+
+    def test_unchanged_edit_is_acknowledged_without_sending_again(self):
+        for _ in range(2):
+            self.store.enqueue('menu',{'chat_id':101,'text':'one'},101)
+            self.worker.flush_replies()
+            self.telegram.error=TelegramError(400,reason='unchanged')
+        self.assertEqual(self.store.outgoing(),[])
+        self.assertEqual([method for method,_ in self.telegram.calls],['sendMessage','editMessageText'])
+
+    def test_new_menu_supersedes_delayed_screen(self):
+        self.store.enqueue('menu',{'chat_id':101,'text':'old'},101)
+        self.store.retry(self.store.outgoing()[0]['id'],60)
+        self.store.enqueue('menu',{'chat_id':101,'text':'new'},101)
+        self.worker.flush_replies()
+        self.assertEqual(self.telegram.calls,[('sendMessage',{'chat_id':101,'text':'new'})])
+        self.assertEqual(self.store.outgoing(),[])
+
     def test_outgoing_old_binding_is_dropped_without_sending(self):
         self.store.enqueue('sendMessage',{'chat_id':101,'text':'private data'},101,'old')
         self.backend.generation='new';self.worker.flush_replies()

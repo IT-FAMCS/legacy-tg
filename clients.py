@@ -12,9 +12,9 @@ class ApiError(RuntimeError):
         super().__init__(message);self.status=status
 
 class TelegramError(RuntimeError):
-    def __init__(self,code,retry_after=None):
+    def __init__(self,code,retry_after=None,reason=None):
         super().__init__(f'Telegram operation failed ({code})')
-        self.code=code;self.retry_after=retry_after
+        self.code=code;self.retry_after=retry_after;self.reason=reason
 
 
 def validate_backend_url(url):
@@ -67,5 +67,12 @@ class TelegramClient:
         if not isinstance(data,dict) or data.get('ok') is not True:
             code=data.get('error_code',500) if isinstance(data,dict) else 500
             retry=data.get('parameters',{}).get('retry_after') if isinstance(data,dict) else None
-            raise TelegramError(code,min(86400,max(1,int(retry))) if isinstance(retry,(int,float)) else None)
+            reason=None
+            description=str(data.get('description','')).lower() if isinstance(data,dict) else ''
+            if code==400 and 'message is not modified' in description:
+                reason='unchanged'
+            elif code==400 and any(phrase in description for phrase in
+                    ('message to edit not found',"message can't be edited",'message_id_invalid')):
+                reason='missing'
+            raise TelegramError(code,min(86400,max(1,int(retry))) if isinstance(retry,(int,float)) else None,reason)
         return data.get('result')
