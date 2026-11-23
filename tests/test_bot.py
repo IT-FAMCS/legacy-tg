@@ -39,11 +39,15 @@ class TelegramTests(unittest.TestCase):
             requests.append((request.full_url.rsplit("/", 1)[-1], json.loads(request.data)))
             self.assertEqual(request.get_method(), "POST")
             self.assertGreater(timeout, 0)
-            return io.BytesIO(b'{"ok":true,"result":true}')
-        with patch("bot.urlopen", side_effect=respond):
+            method = request.full_url.rsplit('/', 1)[-1]
+            value = {} if method.startswith('get') else True
+            return io.BytesIO(json.dumps({'ok': True, 'result': value}).encode())
+        with patch("clients.urlopen", side_effect=respond):
             bot.configure_bot(bot.Settings.from_env({"BOT_TOKEN": "123:secret"}))
         self.assertEqual(requests, [
+            ("getMyName", {}),
             ("setMyName", {"name": "Наследие ФПМИ"}),
+            ("getChatMenuButton", {}),
             ("setChatMenuButton", {"menu_button": {"type": "web_app", "text": "Открыть Наследие", "web_app": {"url": "https://famcs-legacy.by"}}}),
         ])
 
@@ -70,7 +74,7 @@ class TelegramTests(unittest.TestCase):
                     bot.call_api("123:secret", "setMyName", {})
 
     def test_failed_configuration_never_starts_health_server(self):
-        with patch.dict("os.environ", {"BOT_TOKEN": "123:secret"}, clear=True), patch("bot.configure_bot", side_effect=RuntimeError("failed")), patch("bot.ThreadingHTTPServer") as server:
+        with patch.dict("os.environ", {"BOT_TOKEN": "123:secret", "TELEGRAM_SERVICE_KEY": "x" * 40}, clear=True), patch('store.Store'), patch("bot.configure_bot", side_effect=RuntimeError("failed")), patch("bot.ThreadingHTTPServer") as server:
             with self.assertLogs("bot", level="ERROR"):
                 self.assertEqual(bot.main(), 1)
             server.assert_not_called()

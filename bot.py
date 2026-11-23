@@ -5,11 +5,14 @@ import logging
 import os
 import re
 import signal
+import sqlite3
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
+from clients import TelegramClient
+from telegram_setup import ensure_setting, menu_matches
 
 LOG = logging.getLogger(__name__)
 
@@ -58,14 +61,13 @@ def call_api(token, method, payload):
 
 
 def configure_bot(settings):
-    call_api(settings.token, "setMyName", {"name": settings.name})
-    call_api(settings.token, "setChatMenuButton", {
-        "menu_button": {
-            "type": "web_app",
-            "text": "Открыть Наследие",
-            "web_app": {"url": settings.webapp_url},
-        },
-    })
+    client = TelegramClient(settings.token)
+    ensure_setting(client, 'getMyName', 'setMyName', {'name': settings.name},
+                   lambda current: isinstance(current, dict) and current.get('name') == settings.name)
+    menu = {'type': 'web_app', 'text': 'Открыть Наследие',
+            'web_app': {'url': settings.webapp_url}}
+    ensure_setting(client, 'getChatMenuButton', 'setChatMenuButton', {'menu_button': menu},
+                   lambda current: menu_matches(current, menu))
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -88,16 +90,20 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     try:
         settings = Settings.from_env(os.environ)
-        configure_bot(settings)
         from clients import BackendClient, TelegramClient
         from store import Store
         from runtime import Runtime
         backend = BackendClient(os.getenv('BACKEND_URL', settings.webapp_url), os.getenv('TELEGRAM_SERVICE_KEY', ''))
         store = Store(os.getenv('BOT_DB_PATH', '/data/bot.sqlite3'))
+        # Validate local storage before making any cosmetic Telegram writes.
+        configure_bot(settings)
         runtime = Runtime(backend, TelegramClient(settings.token), store, settings.webapp_url,
                           int(os.getenv('NOTIFICATION_POLL_SECONDS', '10')))
         runtime.start()
         HealthHandler.readiness = staticmethod(runtime.ready)
+    except sqlite3.Error:
+        LOG.error('Bot storage initialization failed; check database integrity and free disk space')
+        return 1
     except (ValueError, RuntimeError) as error:
         LOG.error("%s", error)
         return 1

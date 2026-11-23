@@ -6,6 +6,7 @@ import time
 from chat import Chat
 from clients import ApiError, TelegramError, TransportError
 from worker import DeliveryWorker
+from telegram_setup import ensure_setting
 
 LOG=logging.getLogger(__name__)
 COMMANDS=[{'command':name,'description':description} for name,description in [
@@ -24,7 +25,8 @@ class Runtime:
         info=self.telegram.call('getWebhookInfo',{})
         if not isinstance(info,dict) or info.get('url'):
             raise RuntimeError('An existing webhook is configured. Remove it explicitly before enabling polling.')
-        self.telegram.call('setMyCommands',{'commands':COMMANDS})
+        ensure_setting(self.telegram,'getMyCommands','setMyCommands',{'commands':COMMANDS},
+                       lambda current: current == COMMANDS)
 
     def ready(self):
         clock=time.monotonic()
