@@ -11,6 +11,18 @@ from worker import DeliveryWorker
 from runtime import Runtime
 
 class TransportTests(unittest.TestCase):
+    def test_animation_upload_uses_multipart_with_local_gif_and_caption(self):
+        with tempfile.TemporaryDirectory() as temp:
+            gif=Path(temp)/'raccoon.gif';gif.write_bytes(b'GIF89a-test-animation')
+            def response(request,**kwargs):
+                self.assertIn('multipart/form-data',request.get_header('Content-type'))
+                self.assertIn(b'GIF89a-test-animation',request.data)
+                self.assertIn(b'name="animation"; filename="raccoon.gif"',request.data)
+                self.assertIn('Одобрена'.encode(),request.data)
+                return io.BytesIO(b'{"ok":true,"result":{"message_id":2}}')
+            with patch('clients.urlopen',side_effect=response):
+                self.assertEqual(TelegramClient('test-token').call('sendAnimation',{'chat_id':101,'animation':gif,'caption':'Одобрена'})['message_id'],2)
+
     def test_telegram_result_objects_and_rate_limit_are_supported_without_secret_errors(self):
         client=TelegramClient('123:private-token')
         with patch('clients.urlopen',return_value=io.BytesIO(b'{"ok":true,"result":{"message_id":1}}')):

@@ -1,5 +1,6 @@
 """Delivery worker independent from long polling; no real sends in unit tests."""
 import time
+from pathlib import Path
 from clients import ApiError, TelegramError, TransportError
 
 class DeliveryWorker:
@@ -126,8 +127,17 @@ class DeliveryWorker:
                             self.budget_edit('editMessageText',{**payload,'text':budget_text(row)+'\nЗаявка обработана: '+('одобрена' if row['status']=='approved' else 'отклонена')})
                 elif kind=='outcome':
                     row=current['request']
-                    self.telegram.call('sendMessage',{'chat_id':event['chat_id'],
-                        'text':f"Заявка №{row['id']} {'одобрена' if row['status']=='approved' else 'отклонена'}. Сумма: {row['amount']} BYN.\n{row['description']}"})
+                    result=f"Заявка №{row['id']} {'одобрена' if row['status']=='approved' else 'отклонена'}. Сумма: {row['amount']} BYN."
+                    text=result+'\n'+row['description']
+                    if row['status']=='approved':
+                        fits=len(text.encode('utf-16-le'))//2<=1024
+                        if not event.get('outcome_message_id'):
+                            extra['outcome_message_id']=self.telegram.call('sendAnimation',{'chat_id':event['chat_id'],
+                                'animation':Path(__file__).resolve().parent/'assets'/'budget-approved-raccoon.gif',
+                                'caption':text if fits else result})['message_id']
+                            self.backend.request('POST',endpoint+'/ack',{'lease_token':event['lease_token'],'outcome':'progress',**extra})
+                        if not fits:self.telegram.call('sendMessage',{'chat_id':event['chat_id'],'text':row['description']})
+                    else:self.telegram.call('sendMessage',{'chat_id':event['chat_id'],'text':text})
                 else:
                     row=current['request'];message_id=event.get('detail_message_id')
                     # First sends are passive. Only a durably recorded ID may receive action buttons.

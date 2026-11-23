@@ -85,3 +85,50 @@ class BudgetChatTests(unittest.TestCase):
         self.message('/budget');self.click('пополнение');self.message('Donation');self.message('5');self.message('/skip')
         self.backend.commit_then_fail=True;self.click('Подтвердить');self.click('Подтвердить')
         self.assertEqual(len(self.backend.requests),1)
+
+    def test_approved_outcome_attaches_bundled_raccoon_and_preserves_long_description(self):
+        from worker import DeliveryWorker
+        owner=self
+        for status in ['approved','rejected']:
+            for description in ['Supplies','Расходы '*300]:
+                row={'id':1,'status':status,'amount':'12.34','description':description}
+                class Backend:
+                    def request(self,method,path,body=None,**kw):
+                        if path.endswith('/claim'):return [{'id':1,'lease_token':'lease','event_type':'outcome','chat_id':101}]
+                        if path.endswith('/validate'):return {'valid':True,'request':row}
+                        return {'ok':True}
+                class Telegram:
+                    def __init__(self):self.calls=[]
+                    def call(self,method,payload):self.calls.append((method,payload));return {'message_id':7}
+                telegram=Telegram();DeliveryWorker(Backend(),telegram,self.store).budget_notifications()
+                if status=='approved':
+                    animation=next(p for method,p in telegram.calls if method=='sendAnimation')
+                    self.assertTrue(Path(animation['animation']).is_file());self.assertIn('12.34',animation['caption'])
+                    self.assertLessEqual(len(animation['caption'].encode('utf-16-le'))//2,1024)
+                else:self.assertFalse(any(method=='sendAnimation' for method,_ in telegram.calls))
+                texts=''.join(p.get('text',p.get('caption','')) for _,p in telegram.calls)
+                self.assertIn(description,texts)
+
+    def test_long_approval_retry_does_not_resend_successful_animation(self):
+        from worker import DeliveryWorker
+        from clients import TelegramError
+        row={'id':1,'status':'approved','amount':'12.34','description':'Расходы '*200}
+        class Backend:
+            def __init__(self):self.progress=None
+            def request(self,method,path,body=None,**kw):
+                if path.endswith('/claim'):return [{'id':1,'lease_token':'lease','event_type':'outcome','chat_id':101,'outcome_message_id':self.progress}]
+                if path.endswith('/validate'):return {'valid':True,'request':row}
+                if body.get('outcome')=='progress':self.progress=body.get('outcome_message_id')
+                return {'ok':True}
+        class Telegram:
+            def __init__(self):self.calls=[];self.failed=False
+            def call(self,method,payload):
+                if method=='sendMessage' and not self.failed:
+                    self.failed=True;raise TelegramError(429,retry_after=1)
+                self.calls.append((method,payload));return {'message_id':77}
+        backend=Backend();telegram=Telegram();worker=DeliveryWorker(backend,telegram,self.store)
+        worker.budget_notifications()
+        from unittest.mock import patch
+        with patch.object(self.store,'sending_allowed',return_value=True):worker.budget_notifications()
+        self.assertEqual(sum(method=='sendAnimation' for method,_ in telegram.calls),1)
+        self.assertTrue(any(method=='sendMessage' for method,_ in telegram.calls))

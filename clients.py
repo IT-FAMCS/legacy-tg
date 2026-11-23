@@ -1,6 +1,8 @@
 """HTTP clients with sanitized errors: never print tokens, URLs or service keys."""
 import ipaddress
 import json
+import secrets
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
@@ -56,8 +58,23 @@ class BackendClient:
 class TelegramClient:
     def __init__(self,token):self.token=token
     def call(self,method,payload):
-        request=Request(f'https://api.telegram.org/bot{self.token}/{method}',data=json.dumps(payload,ensure_ascii=False).encode(),
-                        headers={'Content-Type':'application/json'},method='POST')
+        if method=='sendAnimation' and isinstance(payload.get('animation'),Path):
+            boundary='legacy-'+secrets.token_hex(16)
+            parts=[]
+            for name,value in payload.items():
+                if name=='animation':
+                    try: data=value.read_bytes()
+                    except OSError: raise TransportError('Animation asset temporarily unavailable') from None
+                    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="animation"; filename="{value.name}"\r\nContent-Type: image/gif\r\n\r\n'.encode()+data+b'\r\n')
+                else:
+                    text=json.dumps(value,ensure_ascii=False) if isinstance(value,(dict,list,bool)) else str(value)
+                    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{text}\r\n'.encode())
+            body=b''.join(parts)+f'--{boundary}--\r\n'.encode()
+            content_type='multipart/form-data; boundary='+boundary
+        else:
+            body=json.dumps(payload,ensure_ascii=False).encode();content_type='application/json'
+        request=Request(f'https://api.telegram.org/bot{self.token}/{method}',data=body,
+                        headers={'Content-Type':content_type},method='POST')
         try:
             with urlopen(request,timeout=40 if method=='getUpdates' else 20) as response:data=json.load(response)
         except HTTPError as error:
