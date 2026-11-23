@@ -10,7 +10,7 @@ from worker import DeliveryWorker
 LOG=logging.getLogger(__name__)
 COMMANDS=[{'command':name,'description':description} for name,description in [
     ('start','Главное меню'),('tasks','Мои действующие таски'),('equipment','Оборудка'),
-    ('zones','Зоны мероприятий'),('link','Привязка аккаунта'),('unlink','Отключить аккаунт'),('cancel','Отменить ввод'),('help','Помощь')]]
+    ('budget','Бюджет и возврат денег'),('zones','Зоны мероприятий'),('link','Привязка аккаунта'),('unlink','Отключить аккаунт'),('cancel','Отменить ввод'),('help','Помощь')]]
 
 class Runtime:
     def __init__(self,backend,telegram,store,webapp_url,notification_interval=10):
@@ -67,7 +67,7 @@ class Runtime:
             try:
                 self.worker.flush_replies()
                 if time.monotonic()>=next_notifications:
-                    self.worker.notifications();next_notifications=time.monotonic()+self.notification_interval
+                    self.worker.notifications();self.worker.budget_notifications();next_notifications=time.monotonic()+self.notification_interval
             except (ApiError,TelegramError,TransportError,OSError,sqlite3.Error,ValueError,KeyError,TypeError):
                 LOG.warning('Delivery temporarily unavailable; queued items will retry')
                 next_notifications=time.monotonic()+self.notification_interval

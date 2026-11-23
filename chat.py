@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from clients import ApiError
 from zones_chat import ZonesMixin
 from task_form import TaskFormMixin
+from budget_form import BudgetFormMixin
 
 PAGE=5
 
@@ -32,7 +33,7 @@ def date_label(value):
     except ValueError:return str(value)
 
 
-class Chat(TaskFormMixin,ZonesMixin):
+class Chat(BudgetFormMixin,TaskFormMixin,ZonesMixin):
     def __init__(self,backend,store,webapp_url):
         self.backend,self.store,self.webapp_url=backend,store,webapp_url.rstrip('/')
         self.me=None
@@ -66,6 +67,7 @@ class Chat(TaskFormMixin,ZonesMixin):
 
     def main_menu(self,text='Наследие · выберите раздел'):
         self.reply(text,[[self.button('Таски','tasks')],[self.button('Оборудка','equipment')],[self.button('Мероприятия · зоны','zone_events')],
+                         [self.button('Бюджет','budget_menu')],
                          [{'text':'Открыть Наследие','style':'primary','url':self.webapp_url}],
                          [self.button('Привязка аккаунта','link')]])
 
@@ -89,7 +91,7 @@ class Chat(TaskFormMixin,ZonesMixin):
             text=message.get('text') or ''
             command=text.split(maxsplit=1)[0].split('@')[0] if text else ''
             self.menu_session=f'update:{update_id}'
-            section_commands={'/start','/help','/tasks','/equipment','/zones','/link','/unlink','/cancel'}
+            section_commands={'/start','/help','/tasks','/equipment','/zones','/budget','/link','/unlink','/cancel'}
             self.new_menu=command in section_commands
             try:
                 if command=='/start' and len(text.split(maxsplit=1))==2 and text.split(maxsplit=1)[1].startswith('link_'):
@@ -125,9 +127,11 @@ class Chat(TaskFormMixin,ZonesMixin):
                     if command=='/tasks':self.tasks()
                     elif command=='/equipment':self.equipment()
                     elif command=='/zones':self.events()
+                    elif command=='/budget':self.budget_menu()
                     elif command=='/link':self.reply(f"Аккаунт привязан: {self.me['name']}. Отключить: /unlink.",[[{'text':'Профиль','style':'primary','url':self.webapp_url+'/account'}]])
                     elif command=='/unlink':self.reply('Отключить Telegram от аккаунта Наследия?',[[self.button('Отключить','unlink')],[self.button('Отмена','menu')]])
                     else:self.main_menu('Наследие · таски и оборудка в чате.\n/tasks — список тасок\n/equipment — оборудка\n/zones — зоны мероприятий\n/cancel — отменить ввод\n/unlink — отключить аккаунт')
+                elif self.budget_message(message):pass
                 else:self.text(text)
             except ApiError as error:
                 self.reply(str(error),[[self.button('Главное меню','menu')]])
@@ -274,7 +278,7 @@ class Chat(TaskFormMixin,ZonesMixin):
         self.reply('Выберите пользователя' if scope=='users' else 'Выберите место хранения',rows)
 
     def action(self,data,token):
-        if self.task_form_action(data,token) or self.zone_action(data,token):return
+        if self.budget_action(data,token) or self.task_form_action(data,token) or self.zone_action(data,token):return
         kind=data['kind'];page=data.get('page',0);item_id=data.get('id')
         if kind=='menu':self.main_menu()
         elif kind=='link':self.reply('Управление привязкой: /link или /unlink.',[[{'text':'Профиль','style':'primary','url':self.webapp_url+'/account'}]])

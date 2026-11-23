@@ -99,3 +99,87 @@ class DeliveryWorker:
                 if error.retry_after:extra['retry_after']=error.retry_after
             except TransportError:outcome='retry'
             self.backend.request('POST',f"service/notifications/{row['id']}/ack",{'lease_token':row['lease_token'],'outcome':outcome,**extra})
+
+
+    def budget_notifications(self):
+        if not self.store.sending_allowed():return
+        rows=self.backend.request('POST','budget/notifications/claim',{'limit':1})
+        self.last_backend_ok=time.monotonic()
+        for event in rows:
+            extra={};outcome='delivered';kind=event['event_type']
+            endpoint=f"budget/notifications/{event['id']}"
+            def validate():
+                return self.backend.request('POST',endpoint+'/validate',{'lease_token':event['lease_token']})
+            try:
+                current=validate()
+                if not current['valid']:
+                    if event.get('detail_message_id'):
+                        self.budget_edit('editMessageReplyMarkup',{'chat_id':event['chat_id'],'message_id':event['detail_message_id'],'reply_markup':{'inline_keyboard':[]}})
+                    outcome='permanent'
+                elif kind=='processed':
+                    if event.get('detail_message_id'):
+                        payload={'chat_id':event['chat_id'],'message_id':event['detail_message_id'],'reply_markup':{'inline_keyboard':[]}}
+                        if current.get('cleanup_only'):
+                            self.budget_edit('editMessageReplyMarkup',payload)
+                        else:
+                            row=current['request']
+                            self.budget_edit('editMessageText',{**payload,'text':budget_text(row)+'\nЗаявка обработана: '+('одобрена' if row['status']=='approved' else 'отклонена')})
+                elif kind=='outcome':
+                    row=current['request']
+                    self.telegram.call('sendMessage',{'chat_id':event['chat_id'],
+                        'text':f"Заявка №{row['id']} {'одобрена' if row['status']=='approved' else 'отклонена'}. Сумма: {row['amount']} BYN.\n{row['description']}"})
+                else:
+                    row=current['request'];message_id=event.get('detail_message_id')
+                    # First sends are passive. Only a durably recorded ID may receive action buttons.
+                    if not message_id:
+                        message_id=self.telegram.call('sendMessage',{'chat_id':event['chat_id'],'text':budget_text(row)+'\nПодготовка заявки…'})['message_id']
+                        extra['detail_message_id']=message_id
+                        self.backend.request('POST',endpoint+'/ack',{'lease_token':event['lease_token'],'outcome':'progress',**extra})
+                    if current.get('telegram_file_id') and not event.get('photo_message_id'):
+                        current=validate()
+                        if not current['valid']:
+                            outcome='permanent'
+                        else:
+                            extra['photo_message_id']=self.telegram.call('sendPhoto',{'chat_id':event['chat_id'],
+                                'photo':current['telegram_file_id'],'caption':f"Чек / подтверждение заявки №{row['id']}"})['message_id']
+                            self.backend.request('POST',endpoint+'/ack',{'lease_token':event['lease_token'],'outcome':'progress',**extra})
+                    current=validate()
+                    if not current['valid']:
+                        self.budget_edit('editMessageReplyMarkup',{'chat_id':event['chat_id'],'message_id':message_id,'reply_markup':{'inline_keyboard':[]}})
+                        outcome='permanent'
+                    elif outcome!='permanent':
+                        row=current['request']
+                        def button(label,**data):
+                            token=self.store.callback(event['telegram_user_id'],event['generation'],data,persistent=True)
+                            return {'text':label,'callback_data':token}
+                        payload={'chat_id':event['chat_id'],'message_id':message_id,'text':budget_text(row),'reply_markup':{'inline_keyboard':[
+                            [button('Одобрить: наличные',kind='budget_decide',id=row['id'],decision='approved',account='cash',expected_amount=row['amount'])],
+                            [button('Одобрить: карта',kind='budget_decide',id=row['id'],decision='approved',account='card',expected_amount=row['amount'])],
+                            [button('Не одобрить',kind='budget_decide',id=row['id'],decision='rejected')],
+                            [button('Изменить сумму',kind='budget_edit_amount',id=row['id'])]]}}
+                        if not self.budget_edit('editMessageText',payload):
+                            # Deleted canonical message: retry creates a new passive replacement.
+                            replacement=self.telegram.call('sendMessage',{'chat_id':event['chat_id'],'text':budget_text(row)+'\nПодготовка заявки…'})['message_id']
+                            extra['detail_message_id']=replacement;outcome='retry'
+            except ApiError as error:outcome='permanent' if error.status in {403,404,410} else 'retry'
+            except TelegramError as error:
+                if error.code==429:self.store.pause_sending(error.retry_after or 30)
+                outcome='blocked' if error.code==403 else 'retry'
+                if error.retry_after:extra['retry_after']=error.retry_after
+            except TransportError:outcome='retry'
+            self.backend.request('POST',endpoint+'/ack',{'lease_token':event['lease_token'],'outcome':outcome,**extra})
+
+    def budget_edit(self,method,payload):
+        try:self.telegram.call(method,payload);return True
+        except TelegramError as error:
+            if error.reason=='unchanged':return True
+            if error.reason=='missing':return False
+            raise
+
+
+def budget_text(row):
+    kind='Возврат денег' if row['request_type']=='reimbursement' else 'Пополнение бюджета'
+    text=f"Заявка №{row['id']}: {kind}\n{row['applicant_name']}\nОтдел: {', '.join(row['departments']) or 'не указан'}\n{row['description']}\nСумма: {row['amount']} BYN"
+    if row.get('payout_details'):text+='\nРеквизиты: '+row['payout_details']
+    if row.get('amount_changes'):text+='\nИсходная сумма: '+row['submitted_amount']+' BYN (сумма исправлена)'
+    return text
