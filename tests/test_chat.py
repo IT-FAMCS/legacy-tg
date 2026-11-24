@@ -26,6 +26,8 @@ class FakeBackend:
         if path.split('?')[0]=='bot/me':
             if not self.linked:raise ApiError(403,'Привяжите аккаунт')
             return {'user_id':7,'name':'Анна','generation':self.generation,'login':'anna'}
+        if path=='bot/personal-data/me':return {'service':True,'saved_details':True,'policy':{'configured':True,'version':'test'}}
+        if path=='bot/payout-details' and method=='GET':return []
         if path=='bot/events':return []
         if path=='bot/claim':return {'pending':True}
         if path.endswith('/preferences/notifications'):

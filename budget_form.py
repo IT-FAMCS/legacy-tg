@@ -2,6 +2,7 @@
 import secrets
 from decimal import Decimal, InvalidOperation
 from clients import ApiError
+from saved_payouts import SavedPayoutMixin, BANK_HINT
 
 
 def parse_amount(text):
@@ -14,12 +15,16 @@ def parse_amount(text):
     return format(amount, '.2f')
 
 
-class BudgetFormMixin:
+class BudgetFormMixin(SavedPayoutMixin):
     def budget_menu(self):
         self.set_state(None)
+        if not self.api('GET','bot/personal-data/me')['service']:
+            self.budget_privacy();return
         self.reply('Бюджет: выберите тип заявки.',[
             [self.button('Запросить возврат денег','budget_start',request_type='reimbursement')],
             [self.button('Запросить пополнение','budget_start',request_type='add_funds')],
+            [self.button('Сохранённые реквизиты','budget_saved_menu')],
+            [self.button('Персональные данные','budget_privacy_controls')],
             [self.button('Главное меню','menu')]])
 
     def budget_prompt(self,state,step):
@@ -27,17 +32,27 @@ class BudgetFormMixin:
         self.set_state(state)
         prompts={'description':'Напишите, на что потрачены деньги.' if state['values']['request_type']=='reimbursement' else 'Опишите пополнение бюджета.',
                  'amount':'Введите сумму в BYN (например, 12,34).',
-                 'payout_details':'Куда отправить деньги? Укажите реквизиты (до 500 символов).',
+                 'payout_details':'Куда отправить деньги? Укажите реквизиты '+BANK_HINT+' (до 500 символов). Ввод новых реквизитов здесь не сохраняет их в список.',
                  'photo':'Отправьте фото чека.' if state['values']['request_type']=='reimbursement' else 'Отправьте фото подтверждения или /skip, чтобы пропустить.'}
-        self.reply(prompts[step],[[self.button('Отмена','cancel')]])
+        rows=[]
+        if step=='payout_details' and not state.get('manual_payout'):
+            for row in self.api('GET','bot/payout-details'):
+                rows.append([self.button('Использовать: '+row['label'],'budget_saved_choose',id=row['id'],flow=state['flow'])])
+            if rows:rows.append([self.button('Ввести новые без сохранения','budget_new_details',flow=state['flow'])])
+        rows.append([self.button('Отмена','cancel')])
+        self.reply(prompts[step],rows)
 
     def budget_review(self,state):
         state['step']='review'; self.set_state(state)
         values=state['values']
         lines=['Проверьте заявку:','Возврат денег' if values['request_type']=='reimbursement' else 'Пополнение бюджета',
                values['description'],values['amount']+' BYN']
-        if values.get('payout_details'): lines.append('Реквизиты: '+values['payout_details'])
+        payout=values.get('payout_details') or state.get('selected_payout_details')
+        if payout: lines.append('Реквизиты: '+payout)
         lines.append('Фото приложено' if values.get('telegram_file_id') else 'Без фото')
+        if values['request_type']=='reimbursement':
+            self.reply('\n'.join(lines),[[self.button('Подтвердить','budget_submit',flow=state['flow'])],[self.button('Выбрать реквизиты заново','budget_change_details',flow=state['flow'])],[self.button('Заполнить заново','budget_start',request_type=values['request_type']),self.button('Отмена','cancel')]])
+            return
         self.reply('\n'.join(lines),[[self.button('Подтвердить','budget_submit',flow=state['flow'])],
             [self.button('Заполнить заново','budget_start',request_type=values['request_type']),self.button('Отмена','cancel')]])
 
@@ -47,6 +62,8 @@ class BudgetFormMixin:
         if state.get('_menu_message_id'):self.menu_message_id=state['_menu_message_id']
         elif state.get('_menu_session'):self.new_menu=True;self.menu_session=state['_menu_session']
         text=(message.get('text') or '').strip()
+        if self.budget_saved_message(state,text):return True
+        if state['kind']=='budget_privacy':self.reply('Прочитайте условия и используйте кнопки согласия либо /cancel.');return True
         step=state['step']
         if state['kind']=='budget_amount_edit':
             try:
@@ -75,8 +92,11 @@ class BudgetFormMixin:
     def budget_action(self,data,token):
         kind=data['kind']
         if not kind.startswith('budget_'):return False
+        if self.budget_saved_action(data,token):return True
         if kind=='budget_menu':self.budget_menu();return True
         if kind=='budget_start':
+            if not self.api('GET','bot/personal-data/me')['service']:
+                self.budget_privacy();return True
             self.budget_prompt({'flow':secrets.token_hex(8),'values':{'request_type':data['request_type']}},'description');return True
         if kind=='budget_submit':
             state=self.store.state(self.tid,self.generation)
@@ -85,7 +105,12 @@ class BudgetFormMixin:
             self.request_id='budget-submit:'+state['flow']
             try:self.api('POST','bot/budget/requests',state['values'])
             except ApiError as error:
-                if error.status not in {409,422,503}:raise
+                if error.status==403 and not self.api('GET','bot/personal-data/me')['service']:
+                    self.notice=str(error);self.budget_privacy('service','resume_budget',draft=state);return True
+                if error.status in {403,404} and state['values'].get('saved_payout_id'):
+                    state['values'].pop('saved_payout_id',None);state.pop('selected_payout_details',None)
+                    self.notice=str(error);self.budget_prompt(state,'payout_details');return True
+                if error.status not in {403,409,422,503}:raise
                 self.notice=str(error);self.budget_review(state);return True
             self.store.done(token);self.set_state(None);self.main_menu('Заявка сохранена и передана казначеям. Результат придёт сюда.');return True
         rid=data['id']
