@@ -80,3 +80,29 @@ class SavedPayoutTests(unittest.TestCase):
         self.click('Подтвердить')
         self.assertEqual(self.backend.requests[-1]['description'],'Keep after revoke')
         self.assertEqual(self.backend.requests[-1]['payout_details'],'manual account')
+
+    def test_each_request_requires_explicit_payout_choice(self):
+        self.use_backend()
+        for _ in range(2):
+            self.message('/budget');self.click('возврат');self.message('Supplies');self.message('12')
+            state=self.store.state(101)
+            self.assertEqual(state['step'],'payout_details')
+            self.assertNotIn('saved_payout_id',state['values'])
+            self.click('Ввести новые');self.message('one-off account')
+            self.message(photo=[{'file_id':'receipt'}]);self.click('Подтвердить')
+        self.assertEqual(len(self.backend.saved),1)
+        self.assertTrue(all(row['payout_details']=='one-off account' for row in self.backend.requests))
+
+    def test_policy_uses_safe_html_emphasis(self):
+        self.use_backend();self.backend.accepted=False
+        original=self.backend.request
+        def request(method,path,body=None,**kw):
+            result=original(method,path,body,**kw)
+            if path=='bot/personal-data/me':result['policy']['rights']=['Вы вправе отозвать согласие <all> & удалить данные']
+            return result
+        self.backend.request=request
+        self.message('/budget')
+        payload=self.store.outgoing()[-1]['payload']
+        self.assertEqual(payload.get('parse_mode'),'HTML')
+        self.assertIn('<b><u>',payload['text'])
+        self.assertIn('&lt;all&gt; &amp; удалить данные',payload['text'])

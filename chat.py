@@ -55,11 +55,15 @@ class Chat(BudgetFormMixin,TaskFormMixin,ZonesMixin):
         return {'text':clip(text,55),'style':style,
                 'callback_data':self.store.callback(self.tid,self.generation,{'kind':kind,'menu':True,**values})}
 
-    def reply(self,text,rows=None,task_ids=()):
+    def reply(self,text,rows=None,task_ids=(),parse_mode=None):
         if self.notice:
+            if parse_mode=='HTML':
+                from html import escape
+                self.notice=escape(self.notice)
             text=self.notice+'\n\n'+text
             self.notice=''
         payload={'chat_id':self.tid,'text':text,'link_preview_options':{'is_disabled':True}}
+        if parse_mode:payload['parse_mode']=parse_mode
         if rows:payload['reply_markup']={'inline_keyboard':rows}
         if self.new_menu:payload['_new_menu']=self.menu_session
         elif self.menu_message_id:payload['_menu_message_id']=self.menu_message_id

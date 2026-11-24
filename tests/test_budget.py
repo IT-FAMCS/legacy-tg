@@ -53,10 +53,13 @@ class BudgetChatTests(unittest.TestCase):
         self.assertEqual(self.backend.requests[0]['telegram_file_id'],'receipt')
         self.assertEqual(self.backend.requests[0]['amount'],'12.34')
         self.assertIsNone(self.store.state(101))
-    def test_add_funds_skip_photo_and_cancel(self):
-        self.message('/budget'); self.click('пополнение'); self.message('Donation'); self.message('5'); self.message('/skip'); self.click('Подтвердить')
+    def test_add_funds_requires_photo_and_cancel(self):
+        self.message('/budget'); self.click('пополнение'); self.message('Donation'); self.message('5'); self.message('/skip')
+        self.assertEqual(self.store.state(101)['step'],'photo')
+        self.assertEqual(self.backend.requests,[])
+        self.message(photo=[{'file_id':'receipt'}]); self.click('Подтвердить')
         self.assertEqual(self.backend.requests[0]['request_type'],'add_funds')
-        self.assertNotIn('telegram_file_id',self.backend.requests[0])
+        self.assertEqual(self.backend.requests[0]['telegram_file_id'],'receipt')
         self.message('/budget'); self.click('возврат'); self.message('/cancel')
         self.assertIsNone(self.store.state(101))
 
@@ -82,7 +85,7 @@ class BudgetChatTests(unittest.TestCase):
         self.assertFalse(any(method=='editMessageText' for method,_ in telegram.calls))
 
     def test_confirm_retry_after_proxy_failure_reuses_draft_idempotency_key(self):
-        self.message('/budget');self.click('пополнение');self.message('Donation');self.message('5');self.message('/skip')
+        self.message('/budget');self.click('пополнение');self.message('Donation');self.message('5');self.message(photo=[{'file_id':'receipt'}])
         self.backend.commit_then_fail=True;self.click('Подтвердить');self.click('Подтвердить')
         self.assertEqual(len(self.backend.requests),1)
 
@@ -132,3 +135,25 @@ class BudgetChatTests(unittest.TestCase):
         with patch.object(self.store,'sending_allowed',return_value=True):worker.budget_notifications()
         self.assertEqual(sum(method=='sendAnimation' for method,_ in telegram.calls),1)
         self.assertTrue(any(method=='sendMessage' for method,_ in telegram.calls))
+
+    def test_budget_input_sends_distinct_messages_even_after_validation_error(self):
+        self.store.menu_sent(-1,101,80)
+        self.message('/budget');self.click('возврат')
+        sessions=[]
+        for text in ['Supplies','invalid','12','account 123']:
+            self.message(text)
+            payload=self.store.outgoing()[-1]['payload']
+            self.assertIn('_new_menu',payload)
+            self.assertNotIn('_menu_message_id',payload)
+            sessions.append(payload['_new_menu'])
+        self.assertEqual(len(set(sessions)),len(sessions))
+
+    def test_old_review_draft_without_receipt_cannot_submit(self):
+        self.message('/budget');self.click('пополнение');self.message('Donation');self.message('5')
+        state=self.store.state(101);state['step']='review'
+        self.store.set_state(101,self.backend.generation,state)
+        token=self.store.callback(101,self.backend.generation,{'kind':'budget_submit','menu':True,'flow':state['flow']})
+        self.counter+=1
+        self.chat.process({'update_id':self.counter,'callback_query':{'id':str(self.counter),'from':{'id':101},'message':{'chat':{'id':101,'type':'private'}},'data':token}})
+        self.assertEqual(self.backend.requests,[])
+        self.assertEqual(self.store.state(101)['step'],'photo')

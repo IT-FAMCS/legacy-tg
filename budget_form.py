@@ -32,8 +32,8 @@ class BudgetFormMixin(SavedPayoutMixin):
         self.set_state(state)
         prompts={'description':'Напишите, на что потрачены деньги.' if state['values']['request_type']=='reimbursement' else 'Опишите пополнение бюджета.',
                  'amount':'Введите сумму в BYN (например, 12,34).',
-                 'payout_details':'Куда отправить деньги? Укажите реквизиты '+BANK_HINT+' (до 500 символов). Ввод новых реквизитов здесь не сохраняет их в список.',
-                 'photo':'Отправьте фото чека.' if state['values']['request_type']=='reimbursement' else 'Отправьте фото подтверждения или /skip, чтобы пропустить.'}
+                 'payout_details':'Куда отправить деньги? Выберите сохранённые реквизиты кнопкой ниже или введите другие сообщением (до 500 символов). '+BANK_HINT+'. Новые реквизиты автоматически не сохраняются.',
+                 'photo':'Отправьте фото чека. Чек обязателен.'}
         rows=[]
         if step=='payout_details' and not state.get('manual_payout'):
             for row in self.api('GET','bot/payout-details'):
@@ -59,8 +59,7 @@ class BudgetFormMixin(SavedPayoutMixin):
     def budget_message(self,message):
         state=self.store.state(self.tid,self.generation)
         if not state or not state['kind'].startswith('budget_'):return False
-        if state.get('_menu_message_id'):self.menu_message_id=state['_menu_message_id']
-        elif state.get('_menu_session'):self.new_menu=True;self.menu_session=state['_menu_session']
+        self.new_menu=True;self.menu_message_id=None
         text=(message.get('text') or '').strip()
         if self.budget_saved_message(state,text):return True
         if state['kind']=='budget_privacy':self.reply('Прочитайте условия и используйте кнопки согласия либо /cancel.');return True
@@ -76,7 +75,6 @@ class BudgetFormMixin(SavedPayoutMixin):
         if step=='photo':
             photos=message.get('photo') or []
             if photos:values['telegram_file_id']=photos[-1]['file_id']
-            elif text=='/skip' and values['request_type']=='add_funds':pass
             else:self.reply('Нужно фото, отправленное как изображение. /cancel — отмена.');return True
             self.budget_review(state);return True
         if step=='amount':
@@ -92,6 +90,7 @@ class BudgetFormMixin(SavedPayoutMixin):
     def budget_action(self,data,token):
         kind=data['kind']
         if not kind.startswith('budget_'):return False
+        self.new_menu=True;self.menu_message_id=None
         if self.budget_saved_action(data,token):return True
         if kind=='budget_menu':self.budget_menu();return True
         if kind=='budget_start':
@@ -102,6 +101,10 @@ class BudgetFormMixin(SavedPayoutMixin):
             state=self.store.state(self.tid,self.generation)
             if not state or state.get('flow')!=data['flow'] or state.get('step')!='review':
                 self.reply('Черновик устарел. Откройте /budget.');return True
+            if state['values']['request_type']=='reimbursement' and not (state['values'].get('payout_details') or state['values'].get('saved_payout_id')):
+                self.budget_prompt(state,'payout_details');return True
+            if not state['values'].get('telegram_file_id'):
+                self.budget_prompt(state,'photo');return True
             self.request_id='budget-submit:'+state['flow']
             try:self.api('POST','bot/budget/requests',state['values'])
             except ApiError as error:

@@ -1,8 +1,25 @@
 """Owner-only payout templates and explicit paginated personal-data consents."""
 import secrets
+import re
+from html import escape
 from clients import ApiError
 
-BANK_HINT='(белинвест - номер карты, другие банки - ерип/номер счета)'
+BANK_HINT='Белинвест: номер карты, остальные банки - ерип или номер счета'
+PAYOUT_WARNING='<b><u>Не указывайте CVV/CVC, PIN, коды подтверждения и пароли.</u></b>'
+
+
+def policy_emphasis(text):
+    """Escape policy configuration before adding Telegram HTML entities."""
+    parts=re.split(r'(\n\n|(?<=[.!?]) +)',text)
+    result=[]
+    for part in parts:
+        if re.search(r'добровольн|не отправляйте|отозвать|удален|удалён|удалени|отказ|за пределами|риски|вправе',part,re.I):
+            result.append('<b><u>'+escape(part)+'</u></b>')
+        elif ': ' in part:
+            label,body=part.split(': ',1)
+            result.append('<b><u>'+escape(label)+':</u></b> '+escape(body))
+        else:result.append(escape(part))
+    return ''.join(result)
 
 class SavedPayoutMixin:
     def budget_privacy(self,scope='service',next_action='menu',page=0,flow=None,draft=None):
@@ -37,7 +54,7 @@ class SavedPayoutMixin:
             rows.append([{'text':'Контакт для обращений','url':policy['contact']}])
         rows.append([self.button('Отказаться','cancel')])
         purpose='Добровольное хранение до 3 реквизитов для повторного использования в заявках' if scope=='saved_details' else 'Обработка данных для работы в Наследии'
-        self.reply(f'{purpose}\nУсловия {page+1}/{len(pages)}\n\n'+pages[page],rows)
+        self.reply('<b><u>'+escape(purpose)+f'</u></b>\nУсловия {page+1}/{len(pages)}\n\n'+policy_emphasis(pages[page]),rows,parse_mode='HTML')
 
     def budget_saved_menu(self):
         self.set_state(None)
@@ -49,7 +66,7 @@ class SavedPayoutMixin:
             buttons.append([self.button('Удалить: '+row['label'],'budget_saved_delete',id=row['id'])])
         if len(rows)<3:buttons.append([self.button('Добавить реквизиты','budget_saved_add')])
         buttons.extend([[self.button('Условия и отзыв согласия','budget_privacy_controls')],[self.button('Назад в бюджет','budget_menu')]])
-        self.reply(text,buttons)
+        self.reply(escape(text)+'\n\n'+PAYOUT_WARNING,buttons,parse_mode='HTML')
 
     def budget_saved_add(self):
         status=self.api('GET','bot/personal-data/me')
@@ -68,7 +85,7 @@ class SavedPayoutMixin:
         state['values'][step]=text
         if step=='label':
             state['step']='details';self.set_state(state)
-            self.reply('Введите реквизиты '+BANK_HINT+'. До 500 символов. Не присылайте CVV/CVC, PIN, коды подтверждения, пароли или фото карты.',[[self.button('Отмена','cancel')]])
+            self.reply('Введите реквизиты. '+BANK_HINT+'. До 500 символов. '+PAYOUT_WARNING+' Не присылайте фото карты.',[[self.button('Отмена','cancel')]],parse_mode='HTML')
         else:
             state['step']='review';self.set_state(state)
             self.reply(f"Сохранить реквизиты?\n{state['values']['label']}\n{state['values']['details']}",[[self.button('Сохранить реквизиты','budget_saved_save',flow=state['flow'])],[self.button('Отмена','cancel')]])
